@@ -1,0 +1,48 @@
+# ---- 运行时产物（每个人的本机状态，不该进仓库）----
+录制/
+tasks.json
+tasks.json.tmp
+config.json
+config.json.tmp
+proxy_backup.json
+bridge_port.json
+mitm.log
+run.log
+
+# 嗅探 / 调试数据（含真实地址和 decode_key，绝不能提交）
+*.jsonl
+*.jsonl.old
+_debug/
+_ref/
+_bin/_rt/
+
+# 开发自测脚本（本地跑，不随仓库发布）
+_selftest.py
+_uitest.mjs
+_bin/rt.js
+界面预览.png
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器和系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 浏览器临时配置（无头截图/调试用）
+.chrome_shot/
+.chrome_dbg/
+.cdp_profile/
+chrome_dbg.log
+
+# 旧版本备份
+*_backup.py
+*_v3_backup.py
+*_v4_backup.py
