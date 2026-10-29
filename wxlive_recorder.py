@@ -30,7 +30,7 @@ import sniffer as sniff_mod
 import ui as ui_mod
 import wxdecrypt
 
-VERSION = "5.1.0"
+VERSION = "5.2.0"
 BUILD = "2026-10-29"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,6 +53,7 @@ MAX_RECONNECT_FAIL = 4       # 直播连续几次拉不到数据算结束
 # 终态：这些状态的任务不再占用队列
 FINAL_STATES = ("已完成", "失败", "已停止", "已取消", "已中断", "地址失效")
 RUNNING_STATES = ("录制中", "下载中", "收尾中")
+PAUSED = "已暂停"          # 不是终态：随时可以「继续」捡起来
 
 
 # ----------------------------------------------------------------- 通用
@@ -232,11 +233,14 @@ class Recorder(threading.Thread):
     否则在文件中间插进去会让整个流的时间戳错乱、ffmpeg 找不到关键帧。
     """
 
-    def __init__(self, url, flv_path):
+    def __init__(self, url, flv_path, append=False):
         super().__init__(daemon=True)
         self.url = url
         self.flv_path = flv_path
-        self.bytes = 0
+        # append=True 表示这段文件里已经有内容（暂停后继续录），接着往后写 ——
+        # 和断流重连是同一套逻辑：服务端每次都会重发 13 字节文件头，跳过即可
+        self.append = bool(append)
+        self.bytes = os.path.getsize(flv_path) if (append and os.path.isfile(flv_path)) else 0
         self.reconnects = 0
         self.empty_connects = 0
         self.state = "准备中"
@@ -254,13 +258,15 @@ class Recorder(threading.Thread):
         self._stop.set()
 
     def run(self):
-        first = True
+        first = not self.append
         try:
-            f = open(self.flv_path, "wb")
+            f = open(self.flv_path, "ab" if self.append else "wb")
         except Exception as e:
             self.error = f"无法创建文件：{e}"
             self.state = "失败"
             return
+        if self.append:
+            self.log(f"接着已有文件往后录（{fmt_size(self.bytes)}）")
 
         try:
             while not self._stop.is_set():
@@ -544,7 +550,6 @@ STATE = {
     "next_id": 1,
     "logs": [],
     "log_seq": 0,         # 日志单调序号（不能拿 len(logs) 当序号，裁剪后会错乱）
-    "sniff_auto": True,
     "started_at": time.time(),
     "restart_count": 0,
 }
@@ -619,7 +624,7 @@ def public_task(t):
         "silence_stop": bool(t.get("silence_stop")), "wait_live": bool(t.get("wait_live")),
         "audio": bool(t.get("audio")), "kind": t.get("kind", "live"),
         "qpos": qpos, "has_part": bool(t.get("has_part")),
-        "dir": t.get("dir", ""),
+        "dir": t.get("dir", ""), "paused": bool(t.get("paused")),
     }
 
 
@@ -693,7 +698,9 @@ def load_tasks():
         # 排队中的保持排队；蹲守的必须还原成"等待开播"。
         # 这里以前一律写成"排队中"，蹲守任务重启后就退化成普通任务 ——
         # 调度线程拿着还没开播的地址直接开录，几秒后必然报"失败"，白丢一次蹲守。
-        if t.get("status") in ("排队中", "等待开播"):
+        if t.get("status") == PAUSED:
+            t["paused"] = True
+        elif t.get("status") in ("排队中", "等待开播"):
             t["status"] = "等待开播" if t.get("wait_live") else "排队中"
         STATE["tasks"].append(t)
         max_id = max(max_id, int(t.get("id") or 0))
@@ -801,6 +808,7 @@ def start_task(t):
     t["t0"] = time.time()
     t["err"] = ""
     t["note"] = ""
+    t["paused"] = False
     free = disk_free(t["dir"])
     if 0 <= free < 2 * 1024 ** 3:
         add_log(f"⚠ #{t['id']} 磁盘只剩 {free / 1024 ** 3:.1f} GB，长录制可能装不下")
@@ -815,12 +823,15 @@ def start_task(t):
         add_log(f"⬇ 开始下载回放 #{t['id']}　{os.path.basename(t['flv'])}")
         return
 
-    r = Recorder(t["url"], t["flv"])
+    # 已有内容（暂停后继续）就接着往后录，不要覆盖掉暂停前那一段
+    prev = os.path.getsize(t["flv"]) if os.path.isfile(t["flv"]) else 0
+    r = Recorder(t["url"], t["flv"], append=prev > 10240)
     t["rec"] = r
     t["status"] = "录制中"
     r.start()
     STATE["active"] = t["id"]
-    add_log(f"▶ 开始录制 #{t['id']}　{os.path.basename(t['flv'])}")
+    add_log(f"▶ 开始录制 #{t['id']}　{os.path.basename(t['flv'])}"
+            + (f"（已有 {fmt_size(prev)}，接着录）" if prev > 10240 else ""))
 
     if t["silence_stop"]:
         def on_silent():
@@ -848,6 +859,10 @@ def stop_task(tid, reason=""):
         return {"ok": True, "msg": "任务已结束"}
 
     r = t.get("rec")
+    if st == "收尾中":
+        # 收尾里已经在 join 线程 / 转封装了，这时候把它标成"已取消"会让
+        # 收尾线程结束时的判断全部落空，文件白处理一遍
+        return {"ok": True, "msg": "正在收尾，请稍等"}
     if st in RUNNING_STATES and r and r.is_alive():
         r.stop()
         add_log(f"■ 停止 #{t['id']}" + (f"（{reason}）" if reason else ""))
@@ -903,6 +918,7 @@ def retry_task(tid):
     part = (t.get("flv") or "") + ".part"
     t["has_part"] = os.path.isfile(part)
     t["finishing"] = False
+    t["paused"] = False
     t["rec"] = None
     t["err"] = ""
     t["note"] = "重新排队" + (f"，从 {fmt_size(os.path.getsize(part))} 处续传"
@@ -914,6 +930,63 @@ def retry_task(tid):
     add_log(f"↻ #{t['id']} 重新排队　{t['name']}")
     save_tasks()
     return {"ok": True}
+
+
+def pause_all():
+    """全部暂停。
+
+    正在录/下载的停下（文件保留），排队和蹲守的清出队列并标「已暂停」。
+    跟「停止」的区别：状态不进终态，点「继续」能原样捡回来 ——
+    回放从 .part 续传，直播接着同一个 FLV 往后写。
+    """
+    n = 0
+    with LOCK:
+        pending = [t for t in STATE["tasks"]
+                   if t.get("status") in ("排队中", "等待开播")]
+        STATE["queue"] = []
+    for t in pending:
+        t["paused"] = True
+        t["status"] = PAUSED
+        t["note"] = "已暂停"
+        n += 1
+
+    aid = STATE["active"]
+    t = task_by_id(aid) if aid else None
+    if t and t.get("status") in ("录制中", "下载中"):
+        t["paused"] = True
+        stop_task(aid, "全部暂停")
+        n += 1
+
+    save_tasks()
+    if n:
+        add_log(f"⏸ 已暂停 {n} 个任务")
+    return {"ok": True, "n": n,
+            "msg": f"已暂停 {n} 个任务" if n else "没有可暂停的任务"}
+
+
+def resume_all():
+    """恢复所有被暂停的任务，按原顺序重新排队"""
+    n = 0
+    with LOCK:
+        for t in STATE["tasks"]:
+            if t.get("status") != PAUSED:
+                continue
+            t["paused"] = False
+            t["finishing"] = False
+            t["rec"] = None
+            t["err"] = ""
+            t["note"] = "恢复排队"
+            t["status"] = ("等待开播"
+                           if (t.get("wait_live") and t.get("kind") == "live")
+                           else "排队中")
+            if t["id"] not in STATE["queue"]:
+                STATE["queue"].append(t["id"])
+            n += 1
+    save_tasks()
+    if n:
+        add_log(f"▶ 恢复 {n} 个任务")
+    return {"ok": True, "n": n,
+            "msg": f"已恢复 {n} 个任务" if n else "没有被暂停的任务"}
 
 
 def dedup_tasks(apply=True):
@@ -970,11 +1043,15 @@ def _finish_replay(t):
                 mb = os.path.getsize(part) / 1048576
             except Exception:
                 mb = 0
-            t["status"] = "已停止"
+            if t.get("paused"):
+                t["status"] = "已暂停"
+                t["note"] = f"已暂停，已下载 {mb:.1f} MB，点「继续」从断点续传"
+            else:
+                t["status"] = "已停止"
+                t["note"] = f"未下载完，已保留断点 {mb:.1f} MB，点「继续」可续传"
+                t["err"] = t["note"]
             t["has_part"] = True
-            t["note"] = f"未下载完，已保留断点 {mb:.1f} MB，点「继续」可续传"
-            t["err"] = t["note"]
-            add_log(f"■ #{t['id']} 下载未完成，断点已保留（{mb:.1f} MB）")
+            add_log(f"{'⏸' if t.get('paused') else '■'} #{t['id']} {t['note']}")
         else:
             t["status"] = "失败"
             t["err"] = (state or "下载失败") + (
@@ -1084,6 +1161,17 @@ def finish_task(t):
 def _finish_live(t):
     flv = t["flv"]
     r = t.get("rec")
+
+    # 「全部暂停」停下来的任务不转封装：FLV 先留着，恢复后接着往后录，
+    # 等真正录完再一次性转，避免中途反复生成/覆盖 mp4。
+    if t.get("paused"):
+        size = os.path.getsize(flv) if os.path.isfile(flv) else 0
+        t["status"] = "已暂停"
+        t["note"] = (f"已暂停，已录 {fmt_size(size)}，点「继续」接着录"
+                     if size > 10240 else "已暂停（这段没录到数据）")
+        add_log(f"⏸ #{t['id']} 已暂停{f'（{fmt_size(size)}）' if size else ''}")
+        return
+
     # 用户主动点"停止"和"直播结束/地址过期"要分开：前者不该标成失败，
     # 否则界面上全是红叉，分不清是出错了还是自己停的。
     by_user = bool(r is not None and getattr(r, "state", "") == "已停止")
@@ -1227,10 +1315,9 @@ def manager():
 
 
 # ----------------------------------------------------------------- 嗅探联动
-def api_sniff_start(auto_start=True):
+def api_sniff_start():
     ok, msg = SNIFFER.start()
     if ok:
-        STATE["sniff_auto"] = bool(auto_start)
         add_log("开始嗅探：只解密 channels.weixin.qq.com，其他网站不受影响")
         add_log("去微信里打开「视频号 → 回放」页面，让它播几秒")
     else:
@@ -1245,6 +1332,12 @@ def api_sniff_stop():
 
 
 def sniff_watch():
+    """盯嗅探进度。
+
+    注意：**抓到之后不自动入队**。回放页右侧的推荐列表会把几十个视频的
+    url + decode_key 一起报上来，自动入队等于往队列里塞一堆根本没人要的视频。
+    这里只负责把结果收进列表 + 写日志，进不进队列由用户在页面上勾。
+    """
     started = None
     while True:
         time.sleep(0.5)
@@ -1260,24 +1353,19 @@ def sniff_watch():
                 started = None
                 continue
             hits = SNIFFER.poll()
+            new_play = [h for h in hits if h.get("played")]
             for h in hits:
+                tag = "回放" if h.get("kind") == "replay" else "直播"
+                extra = ""
                 if h.get("kind") == "replay":
-                    add_log(f"✔ 抓到回放 #{h['id']}　"
-                            + ("带 decode_key" if h.get("decode_key") else "⚠ 没抓到 key"))
-                else:
-                    add_log(f"✔ 抓到直播流 #{h['id']}　有效期至 {h['expiry'] or '未知'}")
-            if hits and STATE["sniff_auto"]:
-                cfg = load_config()
-                for h0 in hits:
-                    try:
-                        new_task(h0.get("name", ""), h0["url"],
-                                 cfg.get("last_dir", "") or DEFAULT_OUTDIR,
-                                 audio=cfg.get("last_audio", False),
-                                 kind=h0.get("kind", "live"),
-                                 decode_key=h0.get("decode_key", ""))
-                        SNIFFER.mark(h0["id"], "已入队")
-                    except Exception as e:
-                        add_log(f"⚠ 自动入队失败：{e}")
+                    extra = "　带 key" if h.get("decode_key") else "　⚠ 没抓到 key"
+                elif h.get("expiry"):
+                    extra = f"　有效期至 {h['expiry']}"
+                add_log(f"＋ 抓到{tag} #{h['id']}　{(h.get('name') or '')[:36]}{extra}")
+            for h in new_play:
+                add_log(f"▶ #{h['id']} 正在播放（已标记为播放页视频）")
+            if len(hits) > 3:
+                add_log(f"　本轮新增 {len(hits)} 条，其中 {len(new_play)} 条是正在播放的")
         except Exception as e:
             add_log(f"嗅探线程异常：{e}")
 
@@ -1499,6 +1587,12 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/task/retry":
             return retry_task(body.get("id"))
 
+        if p == "/api/task/pause_all":
+            return pause_all()
+
+        if p == "/api/task/resume_all":
+            return resume_all()
+
         if p == "/api/task/move":
             return move_task(int(body.get("id") or 0), body.get("dir") or "")
 
@@ -1525,7 +1619,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == "/api/task/clear":
             keep = [x for x in STATE["tasks"]
-                    if x["status"] in ("录制中", "下载中", "收尾中", "排队中", "等待开播")]
+                    if x["status"] in ("录制中", "下载中", "收尾中", "排队中",
+                                       "等待开播", PAUSED)]
             n = len(STATE["tasks"]) - len(keep)
             with LOCK:
                 STATE["tasks"] = keep
@@ -1580,7 +1675,7 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": True, "n": n, "msg": f"清理了 {n} 条重复结果"}
 
         if p == "/api/sniff/start":
-            return api_sniff_start(body.get("auto_start", True))
+            return api_sniff_start()
 
         if p == "/api/sniff/stop":
             return api_sniff_stop()
@@ -1656,7 +1751,6 @@ def api_status(since):
         "dir": load_config().get("last_dir") or DEFAULT_OUTDIR,
         "default_dir": DEFAULT_OUTDIR,
         "sniff": sn, "logs": logs, "next": nxt,
-        "sniff_auto": STATE["sniff_auto"],
         "warnings": warnings,
         "uptime": int(now - STATE["started_at"]),
         "restart_count": STATE["restart_count"],

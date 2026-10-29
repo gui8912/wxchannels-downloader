@@ -12,6 +12,7 @@ mitmproxy 插件：把命中的视频号地址实时写进 jsonl，供录制器�
 import json
 import os
 import re
+import threading
 import time
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,6 +21,7 @@ OUT_ENC = os.path.join(APP_DIR, "sniffed_enc.jsonl")
 DBG_DIR = os.path.join(APP_DIR, "_debug")
 RAW = os.path.join(APP_DIR, "sniffed_raw.jsonl")
 ALL = os.path.join(APP_DIR, "sniffed_all.jsonl")
+PLAYED = os.path.join(APP_DIR, "played.jsonl")
 _SEEN_URL = set()
 
 LIVE_HOST = "wxlivecdn.com"
@@ -63,6 +65,41 @@ def _is_media(url):
         return True
     return any(h in low for h in MEDIA_HOSTS) and any(
         k in low for k in ("/251/", "/20302/", "/20304/", ".mp4", "encfilekey"))
+
+
+# ---------------------------------------------------------------- 谁在播
+#
+# 视频号回放页的右侧有推荐列表，点开一个视频时，页面会把**整屏列表**里每个
+# 视频的播放信息都通过 JSBridge 拿一遍（都有 url + decode_key），所以嗅探
+# 列表里会混进一堆根本没点开的视频。
+#
+# 光看 JSBridge 的响应分不出哪个是"当前播放"的 —— 结构一模一样。但播放器
+# 真开始播时，一定会向 CDN 发媒体请求（Range 拿数据），列表里的视频不会。
+# 所以这里把"真的被请求过的媒体"记下来，回头和 JSBridge 的结果按
+# encfilekey 对齐，就能标出哪个是用户真正在看的那个。
+_SEEN_PLAYED = set()
+_PLAY_LOCK = threading.Lock()
+
+
+def _media_key(url):
+    """同一个视频的地址每次请求都换 token，只有 encfilekey / filekey 稳定"""
+    for pat in (r"[?&]encfilekey=([^&]+)", r"[?&]filekey=([^&]+)",
+                r"[?&]fileid=([^&]+)"):
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
+    return url.split("?")[0]
+
+
+def _record_playing(url):
+    key = _media_key(url)
+    with _PLAY_LOCK:
+        if key in _SEEN_PLAYED:
+            return
+        if len(_SEEN_PLAYED) > 4000:
+            _SEEN_PLAYED.clear()
+        _SEEN_PLAYED.add(key)
+    _append(PLAYED, {"t": round(time.time(), 3), "key": key, "url": url[:400]})
 
 
 def _walk(obj, out, meta):
@@ -456,11 +493,13 @@ def response(flow):
 
     # --- 直播流地址
     if _is_live(url):
+        _record_playing(url)
         _append(OUT, {"t": round(time.time(), 3), "kind": "live", "url": url})
         return
 
     # --- 回放媒体：记下服务端告知的加密长度
     if _is_media(url):
+        _record_playing(url)
         h = flow.response.headers if flow.response else {}
         enc_flag = h.get("x-encflag") or h.get("X-encflag") or ""
         enc_len = h.get("x-enclen") or h.get("X-enclen") or ""

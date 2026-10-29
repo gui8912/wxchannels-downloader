@@ -30,6 +30,7 @@ import winreg
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKUP_PATH = os.path.join(APP_DIR, "proxy_backup.json")
 SNIFF_FILE = os.path.join(APP_DIR, "sniffed.jsonl")
+PLAYED_FILE = os.path.join(APP_DIR, "played.jsonl")
 CREATE_NO_WINDOW = 0x08000000
 DEFAULT_PORT = 4880
 MAX_HITS = 400          # 嗅探结果列表最多留多少条
@@ -122,6 +123,21 @@ def port_alive(host, port, timeout=0.4):
             return True
     except Exception:
         return False
+
+
+def media_key(url):
+    """从媒体地址里取稳定的 id。
+
+    同一个视频每次请求都会换一整套 token（encfilekey 之外的签名字段），
+    只有 encfilekey / filekey / fileid 是稳定的，用它做"是不是同一个视频"的判据。
+    和 capture_addon._media_key 必须保持一致。
+    """
+    for pat in (r"[?&]encfilekey=([^&]+)", r"[?&]filekey=([^&]+)",
+                r"[?&]fileid=([^&]+)"):
+        m = re.search(pat, url or "")
+        if m:
+            return m.group(1)
+    return (url or "").split("?")[0]
 
 
 def pick_port(preferred=DEFAULT_PORT, span=30):
@@ -243,6 +259,9 @@ class Sniffer:
         self._locate = 0
         self._lock = threading.Lock()      # 保护 hits / _seen / _locate
         self._io_lock = threading.Lock()   # 保护文件读取位置
+        self._played = set()               # 真正被请求过的媒体 id
+        self._played_loc = 0
+        self._played_lock = threading.Lock()
 
     # --- 收集结果
     def _add_hit(self, url, t=None, meta=None):
@@ -301,6 +320,7 @@ class Sniffer:
                    "filesize": fsize,
                    "duration": meta.get("duration") or 0,
                    "resolution": "",
+                   "played": False,
                    }
             w, h = meta.get("width") or 0, meta.get("height") or 0
             if w and h:
@@ -344,6 +364,50 @@ class Sniffer:
             self.hits = []
             self._seen = set()
         return n
+
+    # --- "这个视频到底在不在播"
+    def _refresh_played(self):
+        """增量读 played.jsonl —— capture_addon 把真正被请求过的媒体写在这里"""
+        if not os.path.isfile(PLAYED_FILE):
+            return
+        with self._played_lock:
+            try:
+                if os.path.getsize(PLAYED_FILE) < self._played_loc:
+                    self._played_loc = 0
+                    self._played.clear()
+                with open(PLAYED_FILE, "r", encoding="utf-8") as f:
+                    f.seek(self._played_loc)
+                    data = f.read()
+                    self._played_loc = f.tell()
+            except Exception:
+                return
+            for line in data.splitlines():
+                try:
+                    k = json.loads(line).get("key")
+                except Exception:
+                    continue
+                if k:
+                    self._played.add(k)
+
+    def _mark_played(self):
+        """把「媒体真的被请求过」的视频标出来。
+
+        回放页右侧推荐列表的视频也会走 JSBridge 把 url + decode_key 全拿一遍，
+        光看数据分不出是谁，所以用"播放器有没有真的去拉这个媒体"当判据。
+        列表里的视频只加载封面图，不会触发 mp4 的 Range 请求。
+        """
+        try:
+            self._refresh_played()
+        except Exception:
+            return
+        if not self._played:
+            return
+        with self._lock:
+            for h in self.hits:
+                if h.get("played"):
+                    continue
+                if media_key(h.get("url", "")) in self._played:
+                    h["played"] = True
 
     def dedup(self):
         """清理重复结果。
@@ -483,6 +547,7 @@ class Sniffer:
     # --- 轮询新抓到的地址
     def poll(self):
         """返回本次新增的 hit 列表（可能为空）"""
+        self._mark_played()
         if not os.path.isfile(SNIFF_FILE):
             return []
         # 后台线程和手动刷新会同时读同一个文件，必须串行
@@ -593,6 +658,7 @@ class Sniffer:
                     pass
             self.state = "已中断"
             self.msg = "嗅探进程退出了，系统代理已自动还原"
+        self._mark_played()
         with self._lock:
             hits = [dict(h) for h in self.hits]
         return {"state": self.state, "msg": self.msg, "caught": self.caught or "",

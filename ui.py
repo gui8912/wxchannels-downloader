@@ -57,6 +57,12 @@ table input[type=text]{background:#0d1117;border:1px solid #30363d;border-radius
 .tag{font-size:11.5px;color:#8b949e;white-space:nowrap}
 .tag.rp{color:#79c0ff;border:1px solid #1f3a5f;border-radius:4px;padding:0 5px}
 .tag.lv{color:#3fb950;border:1px solid #1f4a2a;border-radius:4px;padding:0 5px}
+.tag.pl{color:#d2a8ff;border:1px solid #4c2d6b;border-radius:4px;padding:0 4px;background:#1d1526}
+.filt{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 0 9px;
+  border-bottom:1px solid #21262d;margin-bottom:2px}
+.filt input[type=number]{width:78px;padding:4px 8px;font-size:12.5px}
+.chk{display:flex;align-items:center;gap:5px;cursor:pointer;color:#8b949e;
+  margin:0;font-size:12.5px;user-select:none}
 .st{font-size:11.5px;padding:2px 8px;border-radius:99px;white-space:nowrap;background:#21262d;display:inline-block}
 .st.rec{background:#8b1d1d;color:#fff}
 .st.ok{background:#1a7f37;color:#fff}
@@ -116,9 +122,7 @@ table input[type=text]{background:#0d1117;border:1px solid #30363d;border-radius
       <label style="margin-bottom:2px">① 拿到地址 · 自动嗅探</label>
       <div class="hint" id="sniff-msg">点「开始嗅探」→ 在微信里打开视频号直播间 / 回放并播放几秒 → 地址会进下面的列表</div>
     </div>
-    <div style="flex:0 0 auto;min-width:0;display:flex;gap:12px;align-items:center">
-      <label style="margin:0;display:flex;align-items:center;gap:5px;cursor:pointer;color:#8b949e">
-        <input type="checkbox" id="auto" checked> 抓到自动入队</label>
+    <div style="flex:0 0 auto;min-width:0">
       <button id="b-sniff" onclick="toggleSniff()">📡 开始嗅探</button>
     </div>
   </div>
@@ -134,16 +138,28 @@ table input[type=text]{background:#0d1117;border:1px solid #30363d;border-radius
       <button class="mini primary" onclick="queueSelected()">批量入队</button>
     </div>
   </div>
+  <div class="filt">
+    <label class="chk"><input type="checkbox" id="only-playing"> 只看播放页的视频</label>
+    <span class="tag">体积 ≥</span>
+    <input type="number" id="min-mb" value="0" min="0" step="50">
+    <span class="tag">MB</span>
+    <button class="mini ghost" onclick="setMinMb(0)">不限</button>
+    <button class="mini ghost" onclick="setMinMb(150)">150</button>
+    <button class="mini ghost" onclick="setMinMb(300)">300</button>
+    <button class="mini ghost" onclick="setMinMb(500)">500</button>
+    <span class="tag" id="filter-info"></span>
+  </div>
   <table>
     <thead><tr><th style="width:28px"><input type="checkbox" id="all" onclick="toggleAll()"></th>
       <th style="width:64px" class="sortable" onclick="setSort('t')" title="点击按时间排序">时间<span class="ar" data-k="t"></span></th>
-      <th style="width:46px">类型</th>
+      <th style="width:86px">类型</th>
       <th class="sortable" onclick="setSort('name')" title="点击按名称排序">名称（可改）<span class="ar" data-k="name"></span></th>
       <th style="width:134px" class="sortable" onclick="setSort('size')" title="点击按大小排序（未知大小的始终排在最后）">大小 / 有效期<span class="ar" data-k="size"></span></th>
       <th style="width:60px">状态</th>
       <th style="width:120px">操作</th></tr></thead>
     <tbody id="hits"></tbody>
   </table>
+  <div class="hint" id="hits-empty" style="display:none"></div>
 </div>
 
 <!-- ③ 手动地址 -->
@@ -180,6 +196,8 @@ table input[type=text]{background:#0d1117;border:1px solid #30363d;border-radius
   <div class="row" style="align-items:center;margin-bottom:4px">
     <label style="margin:0;flex:1">⑤ 任务与进度 <span class="tag" id="qinfo"></span></label>
     <div class="sp">
+      <button class="mini" onclick="pauseAll()" title="停下所有录制和下载，文件保留，随时可以恢复">⏸ 全部暂停</button>
+      <button class="mini" onclick="resumeAll()" title="把暂停的任务重新排进队列">▶ 全部恢复</button>
       <button class="mini" onclick="dedupTasks()">🧹 清理重复项</button>
       <button class="mini" onclick="clearDone()">清理已结束</button>
     </div>
@@ -281,8 +299,12 @@ function currentOpts(){
 
 /* ---------- 嗅探结果 ---------- */
 function kindTag(h){
-  return h.kind === "replay" ? '<span class="tag rp">回放</span>'
-                             : '<span class="tag lv">直播</span>';
+  const t = h.kind === "replay" ? '<span class="tag rp">回放</span>'
+                                : '<span class="tag lv">直播</span>';
+  return '<span style="white-space:nowrap;display:inline-flex;gap:3px;align-items:center">'
+    + t + (h.played
+      ? '<span class="tag pl" title="播放器真的请求过这个视频 —— 就是你在看的那条">▶</span>'
+      : "") + '</span>';
 }
 function hitInfo(h){
   if (h.kind === "replay"){
@@ -334,11 +356,50 @@ function sortHits(list){
   });
   return arr;
 }
+/* ---------- 嗅探结果筛选 ----------
+   回放页右侧的推荐列表会把几十个视频一起报上来，列表里混进一堆没人要的。
+   两个筛子：① 只看播放器真的拉过流的那条（就是在看的那个）
+             ② 体积下限（小视频多半是推荐位的碎片）*/
+function filterSig(){
+  return ($("only-playing").checked ? "1" : "0") + ":" + (+$("min-mb").value || 0);
+}
+function setMinMb(v){
+  $("min-mb").value = v;
+  onFilterChange();
+}
+function onFilterChange(){
+  localStorage.setItem("wxlive_filter", filterSig());
+  hitsSig = "";
+  const all = (window.__hits || []);
+  renderHits(all);
+}
+function applyFilter(list){
+  const onlyPlay = $("only-playing").checked;
+  const minMb = +$("min-mb").value || 0;
+  return (list || []).filter(h => {
+    if (onlyPlay && !h.played) return false;
+    if (minMb > 0 && (h.filesize || 0) < minMb * 1048576) return false;
+    return true;
+  });
+}
 function renderHits(raw){
-  const hits = sortHits(raw || []);
-  const sig = hitsSignature(hits);
-  $("hits-card").style.display = (raw && raw.length) ? "" : "none";
-  $("hit-count").textContent = (raw && raw.length) ? "（" + raw.length + " 条）" : "";
+  const all = raw || [];
+  window.__hits = all;
+  const hits = sortHits(applyFilter(all));
+  $("hits-card").style.display = all.length ? "" : "none";
+  $("hit-count").textContent = all.length ? "（" + all.length + " 条）" : "";
+  const shown = (hits.length !== all.length);
+  $("filter-info").textContent = shown
+    ? `筛选后 ${hits.length} / ${all.length} 条` : "";
+  if (all.length && !hits.length){
+    $("hits-empty").style.display = "";
+    $("hits-empty").textContent =
+      "当前筛选条件下没有结果。共抓到 " + all.length +
+      " 条 —— 试试把体积下限调小，或者勾掉「只看播放页的视频」。";
+  } else {
+    $("hits-empty").style.display = "none";
+  }
+  const sig = hitsSignature(hits) + "#" + filterSig();
   if (sig === hitsSig) return;
   hitsSig = sig;
   const tb = $("hits");
@@ -395,8 +456,8 @@ async function queueSelected(){
 
 /* ---------- 任务列表 ---------- */
 const ST_CLASS = {"录制中":"rec","下载中":"rec","收尾中":"rec","已完成":"ok",
-                  "等待开播":"wait","排队中":"wait","失败":"err","地址失效":"err",
-                  "已停止":"wait","已取消":"","已中断":"err"};
+                  "等待开播":"wait","排队中":"wait","已暂停":"wait",
+                  "失败":"err","地址失效":"err","已停止":"wait","已取消":"","已中断":"err"};
 function taskAction(t){
   if (t.status === "录制中" || t.status === "下载中") return "stop";
   if (t.status === "收尾中") return "busy";
@@ -481,6 +542,14 @@ async function delTask(id){
   const d = await post("/api/task/del",{id}); say(d); taskSig="";
 }
 async function retryTask(id){ const d = await post("/api/task/retry",{id}); say(d); taskSig=""; }
+async function pauseAll(){
+  const d = await post("/api/task/pause_all",{});
+  say(d); taskSig="";
+}
+async function resumeAll(){
+  const d = await post("/api/task/resume_all",{});
+  say(d); taskSig="";
+}
 async function moveTask(id, dir){ const d = await post("/api/task/move",{id,dir}); if(!d.ok) toast(d.msg||"","warn"); taskSig=""; }
 async function clearDone(){ const d = await post("/api/task/clear",{}); say(d); taskSig=""; }
 async function dedupTasks(){ const d = await post("/api/task/dedup",{}); say(d); taskSig=""; }
@@ -592,10 +661,10 @@ function logline(t){
 async function toggleSniff(){
   if (!sniffing){
     $("b-sniff").disabled = true;
-    const d = await post("/api/sniff/start", {auto_start:$("auto").checked});
+    const d = await post("/api/sniff/start", {});
     $("b-sniff").disabled = false;
     if (!d.ok) toast(d.msg || "启动失败", "bad");
-    else toast("开始嗅探，去微信里打开回放页", "ok");
+    else toast("开始嗅探，去微信里打开回放页并播放", "ok");
   } else {
     const d = await post("/api/sniff/stop", {});
     say(d);
@@ -617,6 +686,16 @@ $("url").value = localStorage.getItem("wxlive_url") || "";
 $("cname").value = localStorage.getItem("wxlive_name") || "";
 const dl = localStorage.getItem("wxlive_dir"); if (dl) $("dir").value = dl;
 $("url").addEventListener("change", () => localStorage.setItem("wxlive_url", $("url").value));
+$("only-playing").addEventListener("change", onFilterChange);
+$("min-mb").addEventListener("input", onFilterChange);
+/* 恢复上次的筛选条件：0:0 表示"不限 + 看全部" */
+try {
+  const f = (localStorage.getItem("wxlive_filter") || "").split(":");
+  if (f.length === 2){
+    $("only-playing").checked = (f[0] === "1");
+    $("min-mb").value = Math.max(0, +f[1] || 0);
+  }
+} catch(e){}
 expiry(); previewName(); renderSortMarks(); poll();
 </script></body></html>
 """
