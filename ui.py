@@ -47,6 +47,9 @@ button.mini{padding:3px 8px;font-size:12px;border-radius:5px}
 table{width:100%;border-collapse:collapse;font-size:13px;margin-top:4px}
 th{text-align:left;font-weight:500;color:#7d8590;font-size:11.5px;
   padding:6px 7px;border-bottom:1px solid #21262d;white-space:nowrap}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:hover{color:#c9d1d9}
+.ar{font-size:9px;color:#58a6ff;margin-left:1px;opacity:.9}
 td{padding:6px 7px;border-bottom:1px solid #161b22;vertical-align:middle}
 tr:hover td{background:#1c2128}
 table input[type=text]{background:#0d1117;border:1px solid #30363d;border-radius:4px;
@@ -133,8 +136,11 @@ table input[type=text]{background:#0d1117;border:1px solid #30363d;border-radius
   </div>
   <table>
     <thead><tr><th style="width:28px"><input type="checkbox" id="all" onclick="toggleAll()"></th>
-      <th style="width:54px">时间</th><th style="width:46px">类型</th><th>名称（可改）</th>
-      <th style="width:120px">大小 / 有效期</th><th style="width:60px">状态</th>
+      <th style="width:64px" class="sortable" onclick="setSort('t')" title="点击按时间排序">时间<span class="ar" data-k="t"></span></th>
+      <th style="width:46px">类型</th>
+      <th class="sortable" onclick="setSort('name')" title="点击按名称排序">名称（可改）<span class="ar" data-k="name"></span></th>
+      <th style="width:134px" class="sortable" onclick="setSort('size')" title="点击按大小排序（未知大小的始终排在最后）">大小 / 有效期<span class="ar" data-k="size"></span></th>
+      <th style="width:60px">状态</th>
       <th style="width:120px">操作</th></tr></thead>
     <tbody id="hits"></tbody>
   </table>
@@ -290,23 +296,69 @@ function hitsSignature(hits){
   return hits.map(h => [h.id, h.kind, h.name, h.status, h.decode_key ? 1 : 0,
                         h.url ? h.url.length : 0].join("~")).join("|");
 }
-function renderHits(hits){
+
+/* ---------- 嗅探结果排序 ----------
+   回放列表动辄二三十条，从大到小排一下才知道哪个占地方。
+   大小未知（接口没给 file_size）的一律沉底，不参与升降序。
+   排序偏好记在 localStorage，下次打开还是这个排法。 */
+let SORT = {key:"", dir:1};
+try {
+  const s = JSON.parse(localStorage.getItem("wxlive_sort") || "null");
+  if (s && typeof s.key === "string") SORT = s;
+} catch(e){}
+function renderSortMarks(){
+  document.querySelectorAll("#hits-card .ar").forEach(el => {
+    el.textContent = (el.dataset.k === SORT.key) ? (SORT.dir > 0 ? " ▲" : " ▼") : " ⇅";
+  });
+}
+function setSort(k){
+  if (SORT.key === k) SORT.dir = -SORT.dir;
+  else { SORT.key = k; SORT.dir = (k === "size" || k === "t") ? -1 : 1; }
+  localStorage.setItem("wxlive_sort", JSON.stringify(SORT));
+  hitsSig = "";
+  renderSortMarks();
+}
+function sortHits(list){
+  if (!SORT.key) return list;
+  const k = SORT.key, d = SORT.dir, arr = list.slice();
+  arr.sort((a, b) => {
+    if (k === "size"){
+      const va = a.filesize || 0, vb = b.filesize || 0;
+      if (!va && !vb) return 0;
+      if (!va) return 1;
+      if (!vb) return -1;
+      return (va - vb) * d;
+    }
+    if (k === "t") return String(a.t || "").localeCompare(String(b.t || "")) * d;
+    return String(a.name || "").localeCompare(String(b.name || ""), "zh-CN") * d;
+  });
+  return arr;
+}
+function renderHits(raw){
+  const hits = sortHits(raw || []);
   const sig = hitsSignature(hits);
-  $("hits-card").style.display = hits.length ? "" : "none";
-  $("hit-count").textContent = hits.length ? "（" + hits.length + " 条）" : "";
+  $("hits-card").style.display = (raw && raw.length) ? "" : "none";
+  $("hit-count").textContent = (raw && raw.length) ? "（" + raw.length + " 条）" : "";
   if (sig === hitsSig) return;
   hitsSig = sig;
-  const tb = $("hits"); tb.innerHTML = "";
+  const tb = $("hits");
+  // 重建会丢勾选状态，先记下来再还原，否则一刷新勾选就白点了
+  const checked = new Set([...tb.querySelectorAll(".pick:checked")].map(c => c.value));
+  tb.innerHTML = "";
   hits.forEach(h => {
     const tr = document.createElement("tr");
-    tr.innerHTML = '<td><input type="checkbox" class="pick" value="'+h.id+'"></td>'+
+    const on = checked.has(String(h.id)) ? " checked" : "";
+    const joined = h.status === "已入队";
+    tr.innerHTML = '<td><input type="checkbox" class="pick" value="'+h.id+'"'+on+'></td>'+
       "<td>"+esc(h.t||"")+"</td>"+
       "<td>"+kindTag(h)+"</td>"+
       '<td><input type="text" class="hname" data-id="'+h.id+'" value="'+esc(h.name)+'" placeholder="点这里填名称"></td>'+
       '<td><span class="tag">'+hitInfo(h)+"</span></td>"+
       '<td><span class="tag">'+esc(h.status||"")+"</span></td>"+
-      '<td><button class="mini" onclick="recHit('+h.id+')">'+(h.kind==="replay"?"入队下载":"入队录制")+
-      '</button> <button class="mini ghost" onclick="delHit('+h.id+')" title="删除">✕</button></td>';
+      '<td><button class="mini'+(joined?" ghost":"")+'" onclick="recHit('+h.id+')"'+
+        (joined?' title="已在队列里，再点会复用同一条任务，不会重复下载"':' title="加入下载队列"')+'>'+
+        (h.kind==="replay"?"入队下载":"入队录制")+
+      '</button> <button class="mini ghost" onclick="delHit('+h.id+')" title="删除这条结果">✕</button></td>';
     tb.appendChild(tr);
   });
   tb.querySelectorAll(".hname").forEach(inp => {
@@ -565,6 +617,6 @@ $("url").value = localStorage.getItem("wxlive_url") || "";
 $("cname").value = localStorage.getItem("wxlive_name") || "";
 const dl = localStorage.getItem("wxlive_dir"); if (dl) $("dir").value = dl;
 $("url").addEventListener("change", () => localStorage.setItem("wxlive_url", $("url").value));
-expiry(); previewName(); poll();
+expiry(); previewName(); renderSortMarks(); poll();
 </script></body></html>
 """

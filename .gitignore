@@ -19,6 +19,9 @@ _bin/_rt/
 # 开发自测脚本（本地跑，不随仓库发布）
 _selftest.py
 _uitest.mjs
+_sorttest.mjs
+_shot.mjs
+_push.py
 _bin/rt.js
 界面预览.png
 

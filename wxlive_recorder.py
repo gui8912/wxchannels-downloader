@@ -30,7 +30,7 @@ import sniffer as sniff_mod
 import ui as ui_mod
 import wxdecrypt
 
-VERSION = "5.0.0"
+VERSION = "5.1.0"
 BUILD = "2026-10-29"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
