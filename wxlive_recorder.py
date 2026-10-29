@@ -30,7 +30,7 @@ import sniffer as sniff_mod
 import ui as ui_mod
 import wxdecrypt
 
-VERSION = "5.4.0"
+VERSION = "5.5.0"
 BUILD = "2026-10-29"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,12 +48,18 @@ PROBE_INTERVAL = 20          # 蹲守模式探测间隔（秒）
 SILENCE_SECONDS = 300        # 静音多久算"没人了"
 SNIFF_MAX_SECONDS = 1800     # 嗅探最长挂 30 分钟，之后自动停并还原代理
 STALL_SECONDS = 120          # 直播多久没有新数据算卡死
+DL_STALL_SECONDS = 300       # 下载多久没有新字节算卡死
 MAX_RECONNECT_FAIL = 4       # 直播连续几次拉不到数据算结束
 
 # 终态：这些状态的任务不再占用队列
 FINAL_STATES = ("已完成", "失败", "已停止", "已取消", "已中断", "地址失效")
 RUNNING_STATES = ("录制中", "下载中", "收尾中")
 PAUSED = "已暂停"          # 不是终态：随时可以「继续」捡起来
+# 还"活着"的任务：建任务时只有这些状态可以复用（同地址不重复排队）。
+# 以前只排除了「已取消/失败」，于是「已完成/已停止」的旧任务也会被返回 ——
+# 用户下完一个回放再点一次「入队下载」，拿回来的是那个已完成的旧任务，
+# 界面提示"已加入队列"但队列里根本没东西，什么都不会发生。
+ACTIVE_STATES = ("排队中", "等待开播", "录制中", "下载中", "收尾中", PAUSED)
 
 
 # ----------------------------------------------------------------- 通用
@@ -152,6 +158,25 @@ def build_basename(name, with_date=False):
     if with_date:
         base += time.strftime("%Y-%m-%d")
     return base
+
+
+def _uniq_path(p):
+    """目标文件已存在就自动改成 name(2).mp4。
+
+    回放是"下载完才产出最终 mp4"，而建任务时只检查了 .enc.mp4 有没有被
+    占用 —— 上次下载完的「课程.mp4」还躺在目录里，os.replace 会把它直接
+    盖掉。用户已经下好的文件不能这样悄悄没了。
+    """
+    if not p or not os.path.exists(p):
+        return p
+    root, ext = os.path.splitext(p)
+    i = 2
+    while i < 200:
+        cand = f"{root}({i}){ext}"
+        if not os.path.exists(cand):
+            return cand
+        i += 1
+    return f"{root}_{int(time.time())}{ext}"
 
 
 def human_dur(sec):
@@ -559,6 +584,7 @@ STATE = {
     "log_seq": 0,         # 日志单调序号（不能拿 len(logs) 当序号，裁剪后会错乱）
     "started_at": time.time(),
     "restart_count": 0,
+    "paused_order": [],       # 暂停时记下的队列顺序，恢复时照原样排回去
 }
 LOCK = threading.RLock()
 SNIFFER = sniff_mod.Sniffer()
@@ -602,10 +628,11 @@ KIND_CN = {"live": "直播", "replay": "回放"}
 
 def public_task(t):
     """给前端的任务快照。只挑需要的字段，别把 rec 线程对象序列化出去。"""
+    tid = t.get("id")
     qpos = 0
     try:
-        qpos = STATE["queue"].index(t["id"]) + 1
-    except ValueError:
+        qpos = STATE["queue"].index(tid) + 1
+    except (ValueError, TypeError):
         qpos = 0
     total = t.get("total") or 0
     pct = 0.0
@@ -619,8 +646,10 @@ def public_task(t):
     mp3 = t.get("mp3") or ""
     has_mp4 = bool(mp4 and os.path.isfile(mp4))
     has_mp3 = bool(mp3 and os.path.isfile(mp3))
+    # 一律用 .get 取：tasks.json 要是被人手工改过缺了字段，直接下标取值
+    # 会让整个 /api/status 抛 500，页面整片空白（连日志都刷不出来）。
     return {
-        "id": t["id"], "name": t["name"], "status": t["status"],
+        "id": tid, "name": t.get("name", ""), "status": t.get("status", ""),
         "elapsed": round(t.get("elapsed", 0), 1),
         "bytes": t.get("bytes", 0), "total": total, "pct": round(pct, 1),
         "reconnects": t.get("reconnects", 0),
@@ -713,16 +742,20 @@ def load_tasks():
         max_id = max(max_id, int(t.get("id") or 0))
         restored += 1
     STATE["next_id"] = max(int(data.get("next_id") or 0), max_id + 1)
-    # 队列只保留真正还在排队的，其余按 id 顺序补回去
+    # 队列只保留真正还在排队的，其余按 id 顺序补回去。
+    # 「等待开播」必须一起算：蹲守任务重启后就是这个状态，只认"排队中"的话
+    # 它会被留在队列外 —— 界面上写着"等待开播"，但调度线程根本看不到它，
+    # 蹲守就这么悄无声息地丢了。
     q = [i for i in (data.get("queue") or []) if task_by_id(i)]
-    waiting = [t["id"] for t in STATE["tasks"] if t.get("status") == "排队中"]
+    waiting = [t["id"] for t in STATE["tasks"]
+               if t.get("status") in ("排队中", "等待开播")]
     seen = set()
     STATE["queue"] = []
     for i in q + waiting:
         if i in seen:
             continue
         t = task_by_id(i)
-        if t and t.get("status") == "排队中":
+        if t and t.get("status") in ("排队中", "等待开播"):
             STATE["queue"].append(i)
             seen.add(i)
     if restored:
@@ -751,7 +784,9 @@ def new_task(name, url, outdir, limit_min=0, audio=False, silence_stop=False,
     with LOCK:
         if dedup:
             for x in STATE["tasks"]:
-                if x.get("kind") != kind or x.get("status") in ("已取消", "失败"):
+                # 只有还在跑/还排着的才算"已经有了"。终态任务（完成、失败、
+                # 已停止）不该被复用 —— 否则重新下载会变成一次空操作。
+                if x.get("kind") != kind or x.get("status") not in ACTIVE_STATES:
                     continue
                 if x.get("url") == url:
                     return x
@@ -951,6 +986,8 @@ def pause_all():
     with LOCK:
         pending = [t for t in STATE["tasks"]
                    if t.get("status") in ("排队中", "等待开播")]
+        # 记住原来的排队顺序：否则恢复时按 id 排，用户精心调过的顺序就没了
+        STATE["paused_order"] = list(STATE["queue"])
         STATE["queue"] = []
     for t in pending:
         t["paused"] = True
@@ -973,12 +1010,14 @@ def pause_all():
 
 
 def resume_all():
-    """恢复所有被暂停的任务，按原顺序重新排队"""
+    """恢复所有被暂停的任务，按**暂停前的队列顺序**重新排回去"""
     n = 0
+    order = list(STATE.get("paused_order") or [])
+    pend = [t for t in STATE["tasks"] if t.get("status") == PAUSED]
+    pend.sort(key=lambda x: (order.index(x.get("id")) if x.get("id") in order
+                             else 10 ** 6, x.get("id", 0)))
     with LOCK:
-        for t in STATE["tasks"]:
-            if t.get("status") != PAUSED:
-                continue
+        for t in pend:
             t["paused"] = False
             t["finishing"] = False
             t["rec"] = None
@@ -990,6 +1029,7 @@ def resume_all():
             if t["id"] not in STATE["queue"]:
                 STATE["queue"].append(t["id"])
             n += 1
+        STATE["paused_order"] = []
     save_tasks()
     if n:
         add_log(f"▶ 恢复 {n} 个任务")
@@ -1083,6 +1123,10 @@ def _finish_replay(t):
         return
 
     out = enc[:-len(".enc.mp4")] + ".mp4" if enc.endswith(".enc.mp4") else enc[:-4] + ".mp4"
+    # 目录里可能已经有同名 mp4（上次下过、或用户自己放的），别盖掉
+    if os.path.exists(out) and out != enc:
+        out = _uniq_path(out)
+        add_log(f"　 同名文件已存在，改用 {os.path.basename(out)}")
     size_mb = os.path.getsize(enc) / 1048576
 
     chk = wxdecrypt.check(enc)
@@ -1203,6 +1247,9 @@ def _finish_live(t):
         return
 
     mp4 = flv[:-4] + ".mp4"
+    if os.path.exists(mp4):                 # 同样别覆盖用户已有的文件
+        mp4 = _uniq_path(mp4)
+        add_log(f"　 同名文件已存在，改用 {os.path.basename(mp4)}")
     ok, err = ffmpeg_remux(flv, mp4)
     if ok and os.path.isfile(mp4) and os.path.getsize(mp4) > 10240:
         t["mp4"] = mp4
@@ -1243,6 +1290,20 @@ def _do_finish_async(t):
         save_tasks()
 
 
+def _rotate_queue(tid):
+    """把队首挪到队尾。
+
+    蹲守任务每 20 秒才探一次，如果它一直占着队首，后面排队的任务就永远
+    轮不到 —— 加一个还没开播的蹲守，整个队列直接停摆。所以每次探完
+    （或还没到探测时间）就让它排到队尾，给别人让路。
+    """
+    with LOCK:
+        q = STATE["queue"]
+        if len(q) < 2 or q[0] != tid:
+            return
+        q.append(q.pop(0))
+
+
 def manager():
     """总调度：跑队列 + 盯当前任务 + 蹲守探测"""
     while True:
@@ -1278,6 +1339,15 @@ def manager():
                         add_log(f"{reason}，停止 #{aid}")
                         stop_task(aid, reason)
 
+                # 下载也要防卡死：服务端每 30 秒挤几个字节也算"还连着"，
+                # 那样最后一次 read 永远不会超时，任务就永远结束不了，
+                # 队列后面的全被拖住。所以按"字节数有没有增长"来判断。
+                if t["status"] == "下载中" and r and r.is_alive():
+                    last = getattr(r, "last_data", 0) or t["t0"] or time.time()
+                    if time.time() - last > DL_STALL_SECONDS:
+                        add_log(f"超过 {DL_STALL_SECONDS // 60} 分钟没有新数据，停止 #{aid}")
+                        stop_task(aid, "下载无进展")
+
                 # 线程结束（自然结束 / 被判结束 / 手动停）→ 收尾，且只收一次
                 if (t["status"] in RUNNING_STATES and r
                         and not r.is_alive() and not t["finishing"]):
@@ -1304,11 +1374,13 @@ def manager():
                 continue
             if t["wait_live"] and t["status"] == "等待开播":
                 if time.time() - t["probe_t"] < PROBE_INTERVAL:
+                    _rotate_queue(tid)      # 还没到探测时间，先给后面的让路
                     continue
                 t["probe_t"] = time.time()
                 ok, info = probe_alive(t["url"])
                 if not ok:
                     t["note"] = f"还没开播（{info}）"
+                    _rotate_queue(tid)
                     continue
                 add_log(f"✔ #{tid} 检测到可以拉流了，开始录制")
             with LOCK:
@@ -1445,18 +1517,6 @@ def open_path(path, reveal=False):
 class RecorderServer(ThreadingHTTPServer):
     allow_reuse_address = False     # Windows 上 SO_REUSEADDR 会允许绑定已被监听的端口
     daemon_threads = True
-
-
-def already_running(port):
-    try:
-        with _DIRECT_OPENER.open(f"http://127.0.0.1:{port}/api/status?since=0",
-                                 timeout=1.2) as r:
-            if r.status != 200:
-                return False
-            data = json.loads(r.read().decode("utf-8", "ignore"))
-            return "tasks" in data
-    except Exception:
-        return False
 
 
 def running_instance(port):
@@ -1649,21 +1709,28 @@ class Handler(BaseHTTPRequestHandler):
             return dedup_tasks(apply=bool(body.get("apply", True)))
 
         if p == "/api/task/queue":
-            n = 0
-            last = None
+            n = reused = 0
             for hid in (body.get("ids") or []):
                 h = SNIFFER.hit_by_id(hid)
                 if not h:
                     continue
+                before = len(STATE["tasks"])
                 t = new_task(h.get("name", ""), h["url"], opts["dir"],
                              opts["limit"], opts["audio"], opts["silence"],
                              opts["wait_live"], h.get("kind", "live"),
                              h.get("decode_key", ""),
                              with_date=opts["with_date"])
+                # 同地址已经在队列里时 new_task 会返回旧任务，不算新建 ——
+                # 不然提示"已入队 3 条"其实一条都没加，用户会以为坏了
+                if len(STATE["tasks"]) > before:
+                    n += 1
+                else:
+                    reused += 1
                 SNIFFER.mark(hid, "已入队")
-                last = t
-                n += 1
-            return {"ok": True, "n": n, "msg": f"已入队 {n} 条"}
+            msg = f"新建 {n} 条任务" if n else "没有新建任务"
+            if reused:
+                msg += f"，{reused} 条已在队列里（跳过了）"
+            return {"ok": True, "n": n, "msg": msg}
 
         if p == "/api/hit/record":
             h = SNIFFER.hit_by_id(body.get("id"))
@@ -1750,7 +1817,7 @@ def api_status(since):
     now = time.time()
     tasks = []
     for t in list(STATE["tasks"]):          # 快照遍历，避免与调度线程并发修改冲突
-        if t["status"] in RUNNING_STATES and t.get("t0"):
+        if t.get("status") in RUNNING_STATES and t.get("t0"):
             t["elapsed"] = now - t["t0"]
             r = t.get("rec")
             if r:

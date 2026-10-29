@@ -493,9 +493,9 @@ class Sniffer:
             for h in self.hits:
                 key = (h.get("kind"), (h.get("name") or "").strip(), h.get("filesize") or 0)
                 if key in keep:
-                    idx = order.index(key)
-                    order[idx] = key
-                    # 用后来的覆盖（地址更新）
+                    # 挪到末尾：后来的这条地址最新（旧 token 可能已过期）
+                    order.remove(key)
+                    order.append(key)
                     keep[key] = h
                     removed += 1
                 else:

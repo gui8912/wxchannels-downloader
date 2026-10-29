@@ -24,6 +24,7 @@ _shot.mjs
 _filtertest.mjs
 _datetest.mjs
 _onlyplaying.py
+_fixcheck.py
 _onlytest.mjs
 _dshot.mjs
 _push.py

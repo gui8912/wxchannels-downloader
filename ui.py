@@ -446,7 +446,7 @@ function renderHits(raw){
       '<td><span class="tag">'+hitInfo(h)+"</span></td>"+
       '<td><span class="tag">'+esc(h.status||"")+"</span></td>"+
       '<td><button class="mini'+(joined?" ghost":"")+'" onclick="recHit('+h.id+')"'+
-        (joined?' title="已在队列里，再点会复用同一条任务，不会重复下载"':' title="加入下载队列"')+'>'+
+        (joined?' title="已经入过队了。再点会另外再下一份（文件名自动加序号）"':' title="加入下载队列"')+'>'+
         (h.kind==="replay"?"入队下载":"入队录制")+
       '</button> <button class="mini ghost" onclick="delHit('+h.id+')" title="删除这条结果">✕</button></td>';
     tb.appendChild(tr);
