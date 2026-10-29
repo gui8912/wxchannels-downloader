@@ -139,7 +139,9 @@ table input[type=text]{background:#0d1117;border:1px solid #30363d;border-radius
     </div>
   </div>
   <div class="filt">
-    <label class="chk"><input type="checkbox" id="only-playing"> 只看播放页的视频</label>
+    <label class="chk" title="播放器只会为「正在播放」的那个视频上报播放进度，侧栏推荐不会。默认开着，列表里就只剩你在看的那条"><input type="checkbox" id="only-playing" checked> 只看正在播放的视频</label>
+    <span class="tag" id="hidden-info" style="color:#d29922"></span>
+    <button class="mini ghost" id="b-showall" style="display:none" onclick="setOnlyPlaying(false)">显示全部</button>
     <span class="tag">体积 ≥</span>
     <input type="number" id="min-mb" value="0" min="0" step="50">
     <span class="tag">MB</span>
@@ -307,10 +309,14 @@ function currentOpts(){
 function kindTag(h){
   const t = h.kind === "replay" ? '<span class="tag rp">回放</span>'
                                 : '<span class="tag lv">直播</span>';
+  /* 直播房间里只有这一路流，没有"侧栏推荐"这回事，不打播放态标记 */
+  if (h.kind !== "replay") return t;
+  if (h.now) return '<span style="white-space:nowrap;display:inline-flex;gap:3px;align-items:center">'
+    + t + '<span class="tag pl" title="播放器正在为这个视频上报播放进度 —— 就是你在看的那条">▶ 正在播放</span></span>';
+  if (h.played) return '<span style="white-space:nowrap;display:inline-flex;gap:3px;align-items:center">'
+    + t + '<span class="tag pl" title="这个视频被播放过（可能已经切走了）">▶ 播过</span></span>';
   return '<span style="white-space:nowrap;display:inline-flex;gap:3px;align-items:center">'
-    + t + (h.played
-      ? '<span class="tag pl" title="播放器真的请求过这个视频 —— 就是你在看的那条">▶</span>'
-      : "") + '</span>';
+    + t + '<span class="tag" title="没有被播放过：侧栏推荐列表里的视频。默认已自动过滤">侧栏</span></span>';
 }
 function hitInfo(h){
   if (h.kind === "replay"){
@@ -322,6 +328,7 @@ function hitInfo(h){
 }
 function hitsSignature(hits){
   return hits.map(h => [h.id, h.kind, h.name, h.status, h.decode_key ? 1 : 0,
+                        h.played ? 1 : 0, h.now ? 1 : 0,
                         h.url ? h.url.length : 0].join("~")).join("|");
 }
 
@@ -364,44 +371,60 @@ function sortHits(list){
 }
 /* ---------- 嗅探结果筛选 ----------
    回放页右侧的推荐列表会把几十个视频一起报上来，列表里混进一堆没人要的。
-   两个筛子：① 只看播放器真的拉过流的那条（就是在看的那个）
-             ② 体积下限（小视频多半是推荐位的碎片）*/
+   主筛子（只看正在播放）在**后端**做：播放器只为正在播的那个视频上报播放
+   进度，侧栏推荐不会。放后端是为了顺便把上千条 URL 的传输也省掉。
+   前端只负责体积下限，避免两处逻辑打架。*/
+let HIDDEN = 0, TOTAL = 0;      // 后端过滤掉多少、总共抓到多少
 function filterSig(){
-  return ($("only-playing").checked ? "1" : "0") + ":" + (+$("min-mb").value || 0);
+  return String(+$("min-mb").value || 0);
 }
 function setMinMb(v){
   $("min-mb").value = v;
   onFilterChange();
 }
+async function setOnlyPlaying(on){
+  $("only-playing").checked = !!on;
+  localStorage.setItem("wxlive_only_playing", on ? "1" : "0");
+  hitsSig = "";
+  const d = await post("/api/sniff/filter", {only_playing: !!on});
+  if (d && d.msg) toast(d.msg, "ok");
+  hitsSig = "";
+}
 function onFilterChange(){
   localStorage.setItem("wxlive_filter", filterSig());
   hitsSig = "";
-  const all = (window.__hits || []);
-  renderHits(all);
+  renderHits(window.__hits || []);
 }
 function applyFilter(list){
-  const onlyPlay = $("only-playing").checked;
   const minMb = +$("min-mb").value || 0;
-  return (list || []).filter(h => {
-    if (onlyPlay && !h.played) return false;
-    if (minMb > 0 && (h.filesize || 0) < minMb * 1048576) return false;
-    return true;
-  });
+  if (!minMb) return list || [];
+  return (list || []).filter(h => (h.filesize || 0) >= minMb * 1048576);
 }
 function renderHits(raw){
   const all = raw || [];
   window.__hits = all;
   const hits = sortHits(applyFilter(all));
-  $("hits-card").style.display = all.length ? "" : "none";
+  $("hits-card").style.display = (all.length || HIDDEN) ? "" : "none";
   $("hit-count").textContent = all.length ? "（" + all.length + " 条）" : "";
+  // 被后端过滤掉的侧栏推荐：给个明确数字 + 一键放开的入口，
+  // 否则用户只会看到空列表，以为坏了
+  $("hidden-info").textContent = HIDDEN ? `已自动过滤 ${HIDDEN} 条侧栏推荐` : "";
+  $("b-showall").style.display = (HIDDEN && $("only-playing").checked) ? "" : "none";
   const shown = (hits.length !== all.length);
   $("filter-info").textContent = shown
     ? `筛选后 ${hits.length} / ${all.length} 条` : "";
-  if (all.length && !hits.length){
+  if (!all.length && !HIDDEN){
+    $("hits-empty").style.display = "none";
+  } else if (all.length && !hits.length){
     $("hits-empty").style.display = "";
     $("hits-empty").textContent =
       "当前筛选条件下没有结果。共抓到 " + all.length +
-      " 条 —— 试试把体积下限调小，或者勾掉「只看播放页的视频」。";
+      " 条 —— 试试把体积下限调小。";
+  } else if (!all.length && HIDDEN){
+    $("hits-empty").style.display = "";
+    $("hits-empty").textContent =
+      "抓到了 " + TOTAL + " 条，但都不是正在播放的视频。" +
+      "侧栏推荐已自动过滤 —— 在微信里点一下播放，或者点上面的「显示全部」。";
   } else {
     $("hits-empty").style.display = "none";
   }
@@ -625,6 +648,10 @@ async function poll(){
 
     const sn = d.sniff || {};
     sniffing = (sn.state === "嗅探中");
+    HIDDEN = sn.hidden || 0;
+    TOTAL = sn.total_hits || 0;
+    if (typeof sn.only_playing === "boolean" && $("only-playing").checked !== sn.only_playing)
+      $("only-playing").checked = sn.only_playing;
     $("b-sniff").textContent = sniffing ? "■ 停止嗅探" : "📡 开始嗅探";
     $("b-sniff").className = sniffing ? "danger" : "";
     if (sn.msg){
@@ -697,16 +724,17 @@ $("cname").value = localStorage.getItem("wxlive_name") || "";
 $("datetag").checked = localStorage.getItem("wxlive_datetag") === "1";
 const dl = localStorage.getItem("wxlive_dir"); if (dl) $("dir").value = dl;
 $("url").addEventListener("change", () => localStorage.setItem("wxlive_url", $("url").value));
-$("only-playing").addEventListener("change", onFilterChange);
+$("only-playing").addEventListener("change", e => setOnlyPlaying(e.target.checked));
 $("min-mb").addEventListener("input", onFilterChange);
-/* 恢复上次的筛选条件：0:0 表示"不限 + 看全部" */
+/* 恢复上次的筛选条件。默认「只看正在播放」是开着的 —— 侧栏推荐太吵了 */
 try {
-  const f = (localStorage.getItem("wxlive_filter") || "").split(":");
-  if (f.length === 2){
-    $("only-playing").checked = (f[0] === "1");
-    $("min-mb").value = Math.max(0, +f[1] || 0);
-  }
+  $("only-playing").checked = localStorage.getItem("wxlive_only_playing") !== "0";
+  const old = (localStorage.getItem("wxlive_filter") || "").split(":");
+  const mb = old.length === 2 ? +old[1] : +old[0];
+  if (mb > 0) $("min-mb").value = mb;
 } catch(e){}
+/* 把前端的默认值同步给后端（后端默认也是开，这里只是兜底老浏览器） */
+post("/api/sniff/filter", {only_playing: $("only-playing").checked});
 expiry(); previewName(); renderSortMarks(); poll();
 </script></body></html>
 """

@@ -19,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 BRIDGE_FILE = os.path.join(APP_DIR, "bridge.jsonl")
 OUT_FILE = os.path.join(APP_DIR, "sniffed.jsonl")
+PLAYING_FILE = os.path.join(APP_DIR, "playing.jsonl")   # 谁真的在播（object_id + 播放位置）
 PORT_FILE = os.path.join(APP_DIR, "bridge_port.json")
 PORT = int(os.environ.get("WX_BRIDGE_PORT", "18002"))
 MAX_BODY = 4 * 1024 * 1024
@@ -60,12 +61,23 @@ def _find(obj, out, meta=None, depth=0):
     微信把真正的响应塞在 `jsapi_resp.resp_json` 这种字段里，值是 **JSON 字符串**
     而不是对象。所以遇到长得像 JSON 的字符串必须再解一层递归进去 ——
     否则明明抓到了数据也挖不出 decode_key（第一版就栽在这）。
+
+    顺带把所属视频的 object_id 一起带下去：判断"这条是不是正在播放的那个"
+    全靠它，而它挂在 url 的**爷爷**层（object.id → object_desc → media[]），
+    只能在往下递归时继承。
     """
     meta = meta or {}
     if depth > 14:
         return
     if isinstance(obj, dict):
         m = dict(meta)
+        # object 节点：同时有 id 和 object_desc / object_nonce_id，且 id 是长数字串。
+        # 侧栏推荐和当前播放用的是同一套结构，这里只负责"记下来"，谁在播由
+        # playing.jsonl 里的播放进度决定。
+        oid = obj.get("id")
+        if (isinstance(oid, str) and oid.isdigit() and len(oid) >= 10
+                and ("object_desc" in obj or "object_nonce_id" in obj)):
+            m["objectid"] = oid
         for k in ("description", "title", "shortTitle", "short_title", "desc"):
             v = obj.get(k)
             if isinstance(v, str) and v.strip() and not m.get("title"):
@@ -90,6 +102,7 @@ def _find(obj, out, meta=None, depth=0):
                     u = u + (tok if tok.startswith("&") else "&" + tok)
                 out.append({"url": u, "decode_key": str(dk),
                             "title": m.get("title", ""), "author": m.get("author", ""),
+                            "objectid": m.get("objectid", ""),
                             "size": obj.get("file_size") or obj.get("fileSize") or 0,
                             "duration": obj.get("video_play_len") or obj.get("duration") or 0,
                             "width": int(obj.get("width") or 0),
@@ -113,6 +126,65 @@ def _descend(v, out, meta, depth):
             _find(sub, out, meta, depth + 1)
 
 
+def _play_signal(payload):
+    """从一条上报里读出"哪个视频正在播放"。
+
+    判据来自实测的 JSBridge 数据：播放器每 10 秒会给**正在播放**的那个视频发
+    一次弹幕轮询（cgi = pc_findergetbulletcomment），req_json 里是
+
+        {"finder_basereq":{...},"object_id":"15032073723187175035",
+         "start_timestamp":"30000"}
+
+    start_timestamp 就是当前播放位置（毫秒），换一个视频会从 0 重新开始。
+    侧栏推荐只在列表渲染时批量取过一次信息，不会有这种周期性上报 ——
+    所以"出现过 start_timestamp"就等于"这个视频真的被人点开播了"。
+
+    返回 (object_id, 播放位置毫秒, 是否强信号)；不是播放相关调用就返回 None。
+    """
+    args = payload.get("args")
+    if not isinstance(args, dict):
+        return None
+    rj = args.get("req_json")
+    if isinstance(rj, str):
+        if "object_id" not in rj:
+            return None
+        try:
+            rj = json.loads(rj)
+        except Exception:
+            return None
+    if not isinstance(rj, dict):
+        return None
+    oid = rj.get("object_id") or rj.get("objectid")
+    if not isinstance(oid, str) or not oid.strip():
+        return None
+    oid = oid.strip()
+    pos = rj.get("start_timestamp", rj.get("startTimestamp"))
+    if pos is None:
+        # 有 object_id 但没有播放位置：像"取评论/作者主页"这类调用。
+        # 当成弱证据记下来（也说明用户确实打开过这个视频），但不据此认定"正在播"。
+        return (oid, -1, False)
+    try:
+        pos = int(pos)
+    except Exception:
+        pos = -1
+    return (oid, pos, True)
+
+
+def _note_playing(payload):
+    """把播放信号落盘，供 sniffer 判断哪条结果是"正在播放"的。"""
+    try:
+        sig = _play_signal(payload)
+    except Exception:
+        sig = None
+    if not sig:
+        return None
+    oid, pos, strong = sig
+    _append(PLAYING_FILE, {"t": round(time.time(), 3), "object_id": oid,
+                           "pos": pos, "strong": bool(strong),
+                           "cgi": str((payload.get("args") or {}).get("url") or "")[:80]})
+    return oid
+
+
 def handle_payload(payload):
     """处理一条 JS 上报的数据，返回是否解析出了可用结果"""
     _stats["count"] += 1
@@ -121,6 +193,7 @@ def handle_payload(payload):
     rec = {"t": round(time.time(), 3), "cmd": cmd,
            "page": (payload.get("page") or "")[:200], "raw": payload}
     _append(BRIDGE_FILE, rec)
+    _note_playing(payload)
 
     hits = []
     _find(payload, hits)
@@ -183,6 +256,7 @@ def reparse(path=None):
                 except Exception:
                     continue
                 total += 1
+                _note_playing(rec)          # 历史记录里也藏着播放进度，一起回放出来
                 hits = []
                 _find(rec, hits)
                 for h in hits:

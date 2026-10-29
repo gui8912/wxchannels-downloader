@@ -31,6 +31,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKUP_PATH = os.path.join(APP_DIR, "proxy_backup.json")
 SNIFF_FILE = os.path.join(APP_DIR, "sniffed.jsonl")
 PLAYED_FILE = os.path.join(APP_DIR, "played.jsonl")
+PLAYING_FILE = os.path.join(APP_DIR, "playing.jsonl")
 CREATE_NO_WINDOW = 0x08000000
 DEFAULT_PORT = 4880
 MAX_HITS = 400          # 嗅探结果列表最多留多少条
@@ -262,6 +263,14 @@ class Sniffer:
         self._played = set()               # 真正被请求过的媒体 id
         self._played_loc = 0
         self._played_lock = threading.Lock()
+        # 播放信号（bridge_server 写 playing.jsonl）：哪些 object_id 真的被播过
+        self._played_oids = set()          # 全部播过的
+        self._current_oid = ""             # 最近一次进度上报的那个（= 正在播）
+        self._current_t = 0.0
+        self._play_loc = 0
+        self._play_lock = threading.Lock()
+        self._announced = set()            # 已经写过日志的 played 结果 id
+        self.only_playing = True           # 自动过滤侧栏推荐，默认开
 
     # --- 收集结果
     def _add_hit(self, url, t=None, meta=None):
@@ -309,6 +318,8 @@ class Sniffer:
                         continue          # 标题不同就不是同一个片子，别误合并
                     h["url"] = url
                     h["decode_key"] = str(meta.get("decode_key") or "") or h.get("decode_key", "")
+                    if meta.get("objectid"):
+                        h["objectid"] = str(meta["objectid"])
                     h["t"] = when
                     if fsize and not h.get("filesize"):
                         h["filesize"] = fsize
@@ -317,11 +328,15 @@ class Sniffer:
                    "expiry": exp, "name": "", "status": "待录制",
                    "decode_key": str(meta.get("decode_key") or ""),
                    "author": meta.get("author") or "",
+                   "objectid": str(meta.get("objectid") or ""),
                    "filesize": fsize,
                    "duration": meta.get("duration") or 0,
                    "resolution": "",
                    "played": False,
                    }
+            # 直播流是代理从 FLV 请求里直接抓的，房间里就这一路流，不存在
+            # "侧栏推荐"这回事 —— 直接算作"在播"，否则会被自动过滤误伤。
+            hit["played"] = (kind == "live") or self._is_played(url, hit["objectid"])
             w, h = meta.get("width") or 0, meta.get("height") or 0
             if w and h:
                 hit["resolution"] = "%dx%d" % (int(w), int(h))
@@ -395,19 +410,74 @@ class Sniffer:
         回放页右侧推荐列表的视频也会走 JSBridge 把 url + decode_key 全拿一遍，
         光看数据分不出是谁，所以用"播放器有没有真的去拉这个媒体"当判据。
         列表里的视频只加载封面图，不会触发 mp4 的 Range 请求。
+
+        现在的主判据换成了播放进度上报（见 _refresh_playing）：它比媒体请求更准，
+        而且不需要解密媒体域名 —— 只解密 channels.weixin.qq.com 就够了。
+        媒体请求这条留作补充，两条任一对上就算"播过"。
         """
         try:
             self._refresh_played()
+            self._refresh_playing()
         except Exception:
             return
-        if not self._played:
+        if not self._played and not self._played_oids:
             return
         with self._lock:
             for h in self.hits:
                 if h.get("played"):
                     continue
-                if media_key(h.get("url", "")) in self._played:
+                if self._is_played(h.get("url", ""), h.get("objectid", "")):
                     h["played"] = True
+
+    # --- 播放信号：bridge_server 从弹幕轮询里读出来的 object_id
+    def _refresh_playing(self):
+        """增量读 playing.jsonl。
+
+        播放器每 10 秒给正在播的那个视频报一次播放位置，所以"最新一条"
+        就是此刻在播的；之前播过的也留在集合里，方便用户回头再下载。
+        """
+        if not os.path.isfile(PLAYING_FILE):
+            return
+        with self._play_lock:
+            try:
+                if os.path.getsize(PLAYING_FILE) < self._play_loc:
+                    self._play_loc = 0
+                    self._played_oids.clear()
+                    self._current_oid, self._current_t = "", 0.0
+                with open(PLAYING_FILE, "r", encoding="utf-8") as f:
+                    f.seek(self._play_loc)
+                    data = f.read()
+                    self._play_loc = f.tell()
+            except Exception:
+                return
+            for line in data.splitlines():
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                oid = str(d.get("object_id") or "")
+                if not oid:
+                    continue
+                self._played_oids.add(oid)
+                # 只有带播放位置的（strong）才算"正在播"；-1 那种是"打开过"
+                if d.get("strong"):
+                    try:
+                        ts = float(d.get("t") or 0)
+                    except Exception:
+                        ts = 0.0
+                    if ts >= self._current_t:
+                        self._current_t, self._current_oid = ts, oid
+
+    def _is_played(self, url, oid=""):
+        if oid and oid in self._played_oids:
+            return True
+        return media_key(url) in self._played
+
+    def playing_now(self, within=180):
+        """当前正在播的 object_id（超过 within 秒没再上报就算停了）"""
+        if self._current_oid and (time.time() - self._current_t) <= within:
+            return self._current_oid
+        return ""
 
     def dedup(self):
         """清理重复结果。
@@ -659,10 +729,48 @@ class Sniffer:
             self.state = "已中断"
             self.msg = "嗅探进程退出了，系统代理已自动还原"
         self._mark_played()
+        cur = self.playing_now()
         with self._lock:
-            hits = [dict(h) for h in self.hits]
+            all_hits = [dict(h) for h in self.hits]
+        shown, hidden = all_hits, 0
+        if self.only_playing:
+            # 只挡"能确定是侧栏推荐"的那些：
+            #   · 直播流一律留（房间里只有这一路，没有侧栏）
+            #   · 没有 object_id 的判断不了，宁可放出来也别让用户以为没抓到
+            #   · 有 object_id 但从没被播过的，才是侧栏推荐
+            keep, drop = [], 0
+            for h in all_hits:
+                if (h.get("kind") == "live" or h.get("played")
+                        or not h.get("objectid")):
+                    keep.append(h)
+                else:
+                    drop += 1
+            shown, hidden = keep, drop
+        for h in shown:
+            h["now"] = bool(cur and h.get("objectid") and h["objectid"] == cur)
         return {"state": self.state, "msg": self.msg, "caught": self.caught or "",
-                "alive": alive, "port": self.port, "hits": hits}
+                "alive": alive, "port": self.port, "hits": shown,
+                "hidden": hidden, "total_hits": len(all_hits),
+                "only_playing": bool(self.only_playing),
+                "playing_oid": cur}
+
+    def set_only_playing(self, on):
+        self.only_playing = bool(on)
+        return self.only_playing
+
+    def take_played_events(self):
+        """返回「刚刚被认定是播放页视频」的那些结果，每条只报一次。
+
+        判定是异步的：结果先进列表，等播放器第一次上报播放位置才被标成 played。
+        所以要单独吐一个增量事件流给日志用，否则那条真正在播的视频反而没日志。
+        """
+        with self._lock:
+            out = []
+            for h in self.hits:
+                if h.get("played") and h["id"] not in self._announced:
+                    self._announced.add(h["id"])
+                    out.append(dict(h))
+            return out
 
 
 # ----------------------------------------------------------------- 自愈

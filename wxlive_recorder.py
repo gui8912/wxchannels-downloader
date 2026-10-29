@@ -30,7 +30,7 @@ import sniffer as sniff_mod
 import ui as ui_mod
 import wxdecrypt
 
-VERSION = "5.3.0"
+VERSION = "5.4.0"
 BUILD = "2026-10-29"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1327,7 +1327,7 @@ def api_sniff_start():
     ok, msg = SNIFFER.start()
     if ok:
         add_log("开始嗅探：只解密 channels.weixin.qq.com，其他网站不受影响")
-        add_log("去微信里打开「视频号 → 回放」页面，让它播几秒")
+        add_log("去微信里打开「视频号 → 回放」页面并点播放，只收正在播的那条")
     else:
         add_log("嗅探启动失败：" + msg)
     return {"ok": ok, "msg": msg}
@@ -1347,6 +1347,8 @@ def sniff_watch():
     这里只负责把结果收进列表 + 写日志，进不进队列由用户在页面上勾。
     """
     started = None
+    filtered = 0            # 攒着待上报的"被过滤掉的侧栏推荐"条数
+    last_filtered = 0.0
     while True:
         time.sleep(0.5)
         try:
@@ -1361,19 +1363,21 @@ def sniff_watch():
                 started = None
                 continue
             hits = SNIFFER.poll()
-            new_play = [h for h in hits if h.get("played")]
-            for h in hits:
+            # 真正在播的那条要等播放器上报播放位置才认得出来，所以日志走事件流，
+            # 不能只看 poll() 这一批（它返回时 played 可能还没打上）
+            for h in SNIFFER.take_played_events():
                 tag = "回放" if h.get("kind") == "replay" else "直播"
                 extra = ""
                 if h.get("kind") == "replay":
                     extra = "　带 key" if h.get("decode_key") else "　⚠ 没抓到 key"
                 elif h.get("expiry"):
                     extra = f"　有效期至 {h['expiry']}"
-                add_log(f"＋ 抓到{tag} #{h['id']}　{(h.get('name') or '')[:36]}{extra}")
-            for h in new_play:
-                add_log(f"▶ #{h['id']} 正在播放（已标记为播放页视频）")
-            if len(hits) > 3:
-                add_log(f"　本轮新增 {len(hits)} 条，其中 {len(new_play)} 条是正在播放的")
+                add_log(f"▶ 抓到正在播放的{tag} #{h['id']}　{(h.get('name') or '')[:36]}{extra}")
+            # 侧栏推荐不刷屏：攒够一批只报一行总数
+            filtered += sum(1 for h in hits if not h.get("played"))
+            if filtered and time.time() - last_filtered > 10:
+                add_log(f"· 已自动过滤 {filtered} 条侧栏推荐（勾「显示全部」可查看）")
+                filtered, last_filtered = 0, time.time()
         except Exception as e:
             add_log(f"嗅探线程异常：{e}")
 
@@ -1697,6 +1701,11 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/sniff/poll":
             SNIFFER.poll()
             return {"ok": True}
+
+        if p == "/api/sniff/filter":
+            on = SNIFFER.set_only_playing(body.get("only_playing", True))
+            return {"ok": True, "only_playing": on,
+                    "msg": "只看正在播放的视频" if on else "显示全部结果（含侧栏推荐）"}
 
         if p == "/api/app/restart":
             return api_restart()
