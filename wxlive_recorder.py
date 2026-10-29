@@ -30,7 +30,7 @@ import sniffer as sniff_mod
 import ui as ui_mod
 import wxdecrypt
 
-VERSION = "5.2.0"
+VERSION = "5.3.0"
 BUILD = "2026-10-29"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -141,10 +141,17 @@ def safe_filename(s, limit=80):
     return s
 
 
-def build_basename(name):
-    today = time.strftime("%Y-%m-%d")
-    base = safe_filename(name)
-    return f"{base}_{today}" if base else f"视频号直播_{today}"
+def build_basename(name, with_date=False):
+    """文件名主干。
+
+    默认**不带日期** —— 课程名本来就长，再挂个 _2026-10-29 更难认，
+    同一门课分几次下载还会因为跨天而散成好几份。
+    只有用户主动勾了「文件名加日期」才追加，且按要求直接接在尾部，不加分隔符。
+    """
+    base = safe_filename(name) or "视频号直播"
+    if with_date:
+        base += time.strftime("%Y-%m-%d")
+    return base
 
 
 def human_dur(sec):
@@ -724,7 +731,8 @@ def load_tasks():
 
 # ----------------------------------------------------------------- 任务生命周期
 def new_task(name, url, outdir, limit_min=0, audio=False, silence_stop=False,
-             wait_live=False, kind="live", decode_key="", dedup=True):
+             wait_live=False, kind="live", decode_key="", dedup=True,
+             with_date=False):
     """创建一个任务并排进队列。
 
     dedup=True 时，若已有同 kind + 同 url 或同名字的**活跃**任务，直接返回它，
@@ -752,7 +760,7 @@ def new_task(name, url, outdir, limit_min=0, audio=False, silence_stop=False,
         except Exception as e:
             raise ValueError(f"保存目录不可用：{e}")
 
-        base = build_basename(name)
+        base = build_basename(name, with_date)
 
         # 同名任务可能同时排队，此时文件还没落地，只看 os.path.exists 会撞车
         used = set()
@@ -1563,7 +1571,8 @@ class Handler(BaseHTTPRequestHandler):
                     limit=body.get("limit", 0),
                     audio=bool(body.get("audio", False)),
                     silence=bool(body.get("silence", False)),
-                    wait_live=bool(body.get("wait_live", False)))
+                    wait_live=bool(body.get("wait_live", False)),
+                    with_date=bool(body.get("with_date", False)))
 
         if p == "/api/task/add":
             url = (body.get("url") or "").strip()
@@ -1575,10 +1584,13 @@ class Handler(BaseHTTPRequestHandler):
             t = new_task(body.get("name", ""), url, opts["dir"], opts["limit"],
                          opts["audio"], opts["silence"], opts["wait_live"],
                          body.get("kind") or auto_kind,
-                         body.get("decode_key", ""))
+                         body.get("decode_key", ""),
+                         with_date=opts["with_date"])
             save_config({"last_url": url, "last_dir": opts["dir"],
                          "last_name": safe_filename(body.get("name", "")),
-                         "last_audio": opts["audio"], "ffmpeg": find_ffmpeg()})
+                         "last_audio": opts["audio"],
+                         "last_with_date": opts["with_date"],
+                         "ffmpeg": find_ffmpeg()})
             return {"ok": True, "id": t["id"], "msg": f"已加入队列 #{t['id']}"}
 
         if p == "/api/task/stop":
@@ -1642,7 +1654,8 @@ class Handler(BaseHTTPRequestHandler):
                 t = new_task(h.get("name", ""), h["url"], opts["dir"],
                              opts["limit"], opts["audio"], opts["silence"],
                              opts["wait_live"], h.get("kind", "live"),
-                             h.get("decode_key", ""))
+                             h.get("decode_key", ""),
+                             with_date=opts["with_date"])
                 SNIFFER.mark(hid, "已入队")
                 last = t
                 n += 1
@@ -1654,7 +1667,8 @@ class Handler(BaseHTTPRequestHandler):
                 return {"ok": False, "msg": "结果不存在（可能已被清理）"}
             t = new_task(h.get("name", ""), h["url"], opts["dir"], opts["limit"],
                          opts["audio"], opts["silence"], opts["wait_live"],
-                         h.get("kind", "live"), h.get("decode_key", ""))
+                         h.get("kind", "live"), h.get("decode_key", ""),
+                         with_date=opts["with_date"])
             SNIFFER.mark(body.get("id"), "已入队")
             return {"ok": True, "id": t["id"], "msg": f"已加入队列 #{t['id']}"}
 

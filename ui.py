@@ -187,6 +187,9 @@ table input[type=text]{background:#0d1117;border:1px solid #30363d;border-radius
       <input type="checkbox" id="silence"> 静音 5 分钟自动停</label>
     <label style="margin:0;display:flex;align-items:center;gap:5px;cursor:pointer">
       <input type="checkbox" id="waitlive"> 未开播就蹲守（20 秒探测）</label>
+    <label style="margin:0;display:flex;align-items:center;gap:5px;cursor:pointer"
+           title="默认不加日期。勾上后在名称末尾追加当天日期，如「课程名2026-10-29」">
+      <input type="checkbox" id="datetag"> 文件名加日期</label>
   </div>
   <button class="primary" style="margin-top:12px" onclick="startManual()">▶ 加入队列并开始</button>
 </div>
@@ -289,12 +292,15 @@ function previewName(){
   const raw = ($("cname").value || "").trim().replace(/[\\/:*?"<>|]/g, "_").slice(0,80);
   const d = new Date();
   const ds = d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate());
-  $("fname").textContent = "文件名预览：" + (raw ? raw+"_"+ds : "视频号直播_"+ds) + ".mp4";
+  /* 日期改成可选：默认不带，勾了才追加，且直接接在尾部不加分隔符 */
+  const tail = $("datetag").checked ? ds : "";
+  const shown = raw || "视频号直播";
+  $("fname").textContent = "文件名预览：" + shown + tail + ".mp4";
 }
 function currentOpts(){
   return {dir:$("dir").value.trim(), limit:+$("limit").value||0,
           audio:$("audio").checked, silence:$("silence").checked,
-          wait_live:$("waitlive").checked};
+          wait_live:$("waitlive").checked, with_date:$("datetag").checked};
 }
 
 /* ---------- 嗅探结果 ---------- */
@@ -681,9 +687,14 @@ async function startManual(){
 $("url").addEventListener("input", expiry);
 $("cname").addEventListener("input", previewName);
 $("cname").addEventListener("change", () => localStorage.setItem("wxlive_name", $("cname").value));
+$("datetag").addEventListener("change", () => {
+  localStorage.setItem("wxlive_datetag", $("datetag").checked ? "1" : "0");
+  previewName();
+});
 $("dir").addEventListener("change", () => localStorage.setItem("wxlive_dir", $("dir").value));
 $("url").value = localStorage.getItem("wxlive_url") || "";
 $("cname").value = localStorage.getItem("wxlive_name") || "";
+$("datetag").checked = localStorage.getItem("wxlive_datetag") === "1";
 const dl = localStorage.getItem("wxlive_dir"); if (dl) $("dir").value = dl;
 $("url").addEventListener("change", () => localStorage.setItem("wxlive_url", $("url").value));
 $("only-playing").addEventListener("change", onFilterChange);

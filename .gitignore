@@ -22,6 +22,8 @@ _uitest.mjs
 _sorttest.mjs
 _shot.mjs
 _filtertest.mjs
+_datetest.mjs
+_dshot.mjs
 _push.py
 _bin/rt.js
 界面预览.png
