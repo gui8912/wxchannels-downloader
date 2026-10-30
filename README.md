@@ -85,6 +85,17 @@ python wxlive_recorder.py --cli <URL> 60  # 纯命令行录 60 秒
 
 ---
 
+## 只想要命令行？
+
+[`standalone/`](standalone/) 里放了两个不依赖网页界面的独立脚本：
+
+- `video_rec.py`：ffmpeg 直接转封装为分片 MP4，支持限时录制。
+- `record_live.sh`：纯 curl 拉流，断流自动重连续录为 FLV。
+
+用法、依赖和回归测试见 [standalone/README.md](standalone/README.md)。
+
+---
+
 ## 工作原理
 
 ### 直播：FLV over HTTP
@@ -182,6 +193,7 @@ req_json = {"finder_basereq":{...},
 ├── _bin/
 │   ├── wxdec.js          Node 脚本：加载 wasm 生成密钥流 / 解密
 │   └── wvd.wasm          微信官方播放器的解码模块
+├── standalone/           不依赖网页界面的独立命令行录制脚本
 ├── 启动录制器.bat
 └── 录制/                 默认输出目录
 ```

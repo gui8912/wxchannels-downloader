@@ -1,0 +1,2 @@
+# 命令行脚本必须在任何平台上保持 LF，否则 Bash 会读到 \r
+standalone/*.sh text eol=lf
