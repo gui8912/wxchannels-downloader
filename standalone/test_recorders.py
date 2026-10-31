@@ -4,7 +4,6 @@ import contextlib
 import importlib.util
 import io
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -13,24 +12,54 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+
 def default_bash():
-    if os.name == "nt":
-        candidate = (Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" /
-                     "WorkBuddy/resources/vendor/PortableGit/usr/bin/bash.exe")
-        if candidate.exists():
-            return str(candidate)
+    """Windows 下优先找 Git 自带的 bash，避免误用 System32 的 WSL 启动器。"""
+    if os.name != "nt":
+        return "bash"
+    git = shutil.which("git")
+    if git:
+        for parent in Path(git).resolve().parents:
+            for relative in ("bin/bash.exe", "usr/bin/bash.exe"):
+                candidate = parent / relative
+                if candidate.is_file():
+                    return str(candidate)
+    found = shutil.which("bash")
+    if found and "system32" not in found.lower():
+        return found
     return "bash"
+
+
+def find_ffmpeg():
+    configured = os.environ.get("FFMPEG")
+    if configured and Path(configured).is_file():
+        return Path(configured)
+    found = shutil.which("ffmpeg")
+    return Path(found) if found else None
+
+
+def find_timeout(bash):
+    if os.name != "nt" or bash == "bash":
+        return "timeout"
+    executable = Path(bash)
+    candidates = (
+        executable.with_name("timeout.exe"),
+        executable.parent.parent / "usr/bin/timeout.exe",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return "timeout"
 
 
 ROOT = Path(os.environ.get("RECORDER_ROOT", Path(__file__).resolve().parent))
 BASH = os.environ.get("BASH_EXE") or default_bash()
-TIMEOUT = str(Path(BASH).with_name("timeout.exe")) if BASH != "bash" else "timeout"
-FFMPEG = Path(os.environ.get("FFMPEG")
-              or shutil.which("ffmpeg")
-              or r"D:\WorkBuddy\工具\ffmpeg\package\ffmpeg.exe")
+TIMEOUT = find_timeout(BASH)
+FFMPEG = find_ffmpeg()
 FLV_HEADER = b"FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00"
 PAYLOAD = b"test-flv-tag-data"
 LOCAL_ENV = dict(os.environ, NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
@@ -81,7 +110,7 @@ def load_video_module():
     spec = importlib.util.spec_from_file_location("video_rec_under_test", ROOT / "video_rec.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    if FFMPEG.exists():
+    if FFMPEG:
         module.FFMPEG = str(FFMPEG)
     return module
 
@@ -104,6 +133,7 @@ class PythonRecorderTests(unittest.TestCase):
         stdout = io.StringIO()
         with mock.patch.object(sys, "argv", ["video_rec.py"] + args), \
              mock.patch.object(module.time, "strftime", return_value="FIXED"), \
+             mock.patch.object(module, "_find_ffmpeg", return_value="ffmpeg"), \
              mock.patch.object(module.subprocess, "run", side_effect=fake_run) as run, \
              contextlib.redirect_stdout(stdout):
             rc = module.main()
@@ -136,7 +166,7 @@ class PythonRecorderTests(unittest.TestCase):
             self.assertEqual(len(paths), 2)
             self.assertNotEqual(paths[0], paths[1], "同名输出会覆盖上一段录像")
 
-    @unittest.skipUnless(FFMPEG.exists(), "ffmpeg 不存在")
+    @unittest.skipUnless(FFMPEG is not None, "ffmpeg 不存在")
     def test_real_flv_to_fragmented_mp4(self):
         with tempfile.TemporaryDirectory() as tmp:
             sample = Path(tmp) / "sample.flv"
@@ -187,7 +217,11 @@ class ShellRecorderTests(unittest.TestCase):
             script, out = self.prepare(tmp, url)
             proc = subprocess.Popen(
                 [BASH, script.as_posix(), out.as_posix()],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", env=LOCAL_ENV,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+                env=LOCAL_ENV,
             )
             try:
                 deadline = time.monotonic() + 5

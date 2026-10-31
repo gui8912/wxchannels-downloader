@@ -10,7 +10,7 @@
     - 视频号直播的 pull 地址是 FLV over HTTP（video/x-flv），可以直接用 ffmpeg 拉流。
     - 输出用「分片 MP4」(fragmented mp4)，即使中途被打断，已录部分仍能正常播放。
     - 同名输出自动追加 (2)(3)，不会覆盖已有录像；ffmpeg 失败时程序返回非 0。
-    - 优先用 FFMPEG 环境变量，其次从 PATH 查找；本机已有 ffmpeg 路径存在时自动使用。
+    - 优先用 FFMPEG 环境变量，否则从 PATH 查找。
     - 地址带 txTime/txSecret 签名，过期后返回 403，需要重新抓一次地址。
 """
 import math
@@ -20,10 +20,7 @@ import subprocess
 import sys
 import time
 
-DEFAULT_FFMPEG = r"D:\WorkBuddy\工具\ffmpeg\package\ffmpeg.exe"
-FFMPEG = os.environ.get("FFMPEG") or (
-    DEFAULT_FFMPEG if os.path.isfile(DEFAULT_FFMPEG) else "ffmpeg"
-)
+FFMPEG = os.environ.get("FFMPEG") or "ffmpeg"
 
 
 def _unique_path(path):

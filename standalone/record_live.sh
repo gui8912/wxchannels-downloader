@@ -50,11 +50,13 @@ empty_connects=0
 while [ -f "$STOP_FILE" ]; do
   before=$(wc -c < "$OUT")
   if [ "$first" = "1" ]; then
-    curl -sS --fail --connect-timeout 10 --speed-limit 1 --speed-time 30 -o - "$URL" >> "$OUT"
+    curl -sS --fail --connect-timeout 10 \
+      --speed-limit 1 --speed-time 30 -o - "$URL" >> "$OUT"
     rc=$?
   else
     # 重连后要跳过 13 字节 FLV 文件头（9 字节头 + 4 字节 PrevTagSize）
-    curl -sS --fail --connect-timeout 10 --speed-limit 1 --speed-time 30 -o - "$URL" | tail -c +14 >> "$OUT"
+    curl -sS --fail --connect-timeout 10 \
+      --speed-limit 1 --speed-time 30 -o - "$URL" | tail -c +14 >> "$OUT"
     rc=$?
   fi
   after=$(wc -c < "$OUT")

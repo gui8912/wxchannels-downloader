@@ -9,6 +9,15 @@
 
 两个脚本都不访问网络以外的本地服务，也不会上传任何数据。直播地址含签名，请勿把 `live_url.txt` 或完整地址提交到仓库。
 
+## 获取代码
+
+```bash
+git clone https://github.com/gui8912/wxchannels-downloader.git
+cd wxchannels-downloader/standalone
+```
+
+Windows 运行 Shell 版需要 Git Bash（安装 Git for Windows 时自带）。`live_url.txt`、`.recording` 和录制产物已加入 `.gitignore`。
+
 ## video_rec.py
 
 依赖 Python 3.8+ 和 ffmpeg。ffmpeg 默认从 `PATH` 查找，也可以显式指定：
@@ -16,6 +25,10 @@
 ```bash
 # Windows CMD
 set FFMPEG=D:\tools\ffmpeg\bin\ffmpeg.exe
+python video_rec.py "<直播流URL>" 3600
+
+# Windows PowerShell
+$env:FFMPEG = "D:\tools\ffmpeg\bin\ffmpeg.exe"
 python video_rec.py "<直播流URL>" 3600
 
 # 不限时，录到直播结束或按 Ctrl+C
@@ -26,7 +39,7 @@ python video_rec.py "<直播流URL>"
 
 ## record_live.sh
 
-依赖 bash、curl、tail。先把地址写入脚本同目录的 `live_url.txt`：
+依赖 Bash、curl，以及 `tail` / `wc`（Git Bash 自带）。先把地址写入脚本同目录的 `live_url.txt`：
 
 ```bash
 bash record_live.sh 我的直播.flv

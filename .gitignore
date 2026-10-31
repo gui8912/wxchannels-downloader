@@ -51,6 +51,14 @@ desktop.ini
 .cdp_profile/
 chrome_dbg.log
 
+# 独立命令行脚本的本地输入与产物（地址含签名，绝不能提交）
+standalone/live_url.txt
+standalone/.recording
+standalone/*.flv
+standalone/*.mp4
+standalone/*.mp3
+standalone/*.part
+
 # 旧版本备份
 *_backup.py
 *_v3_backup.py
