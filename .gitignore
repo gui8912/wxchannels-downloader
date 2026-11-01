@@ -2,6 +2,8 @@
 录制/
 tasks.json
 tasks.json.tmp
+tasks.json.bak
+tasks.json.*.tmp
 config.json
 config.json.tmp
 proxy_backup.json
@@ -18,6 +20,7 @@ _bin/_rt/
 
 # 开发自测脚本（本地跑，不随仓库发布）
 _selftest.py
+_audit_tests.py
 _uitest.mjs
 _sorttest.mjs
 _shot.mjs

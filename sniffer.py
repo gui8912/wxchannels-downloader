@@ -14,7 +14,7 @@
 
 安全边界：
   · mitmdump 只监听 127.0.0.1，不暴露到局域网
-  · 只解密 wxlivecdn.com，其它域名走隧道
+  · 只解密 channels.weixin.qq.com 与 *.wxlivecdn.com，其它域名走隧道
   · 代理改动前先备份，退出/崩溃后自动还原
 """
 import ctypes
@@ -36,19 +36,24 @@ CREATE_NO_WINDOW = 0x08000000
 DEFAULT_PORT = 4880
 MAX_HITS = 400          # 嗅探结果列表最多留多少条
 
-# 解密哪些域名 —— 只解密一个，够了。
+# 解密哪些域名 —— 只解密视频号页面与直播 CDN 两类。
 #
 # 为什么不再全量（曾经用过 .*，代价很实在）：
 #   · 视频号的 decode_key 走 JSBridge，不走 HTTP。要拿它只需要往
-#     channels.weixin.qq.com 的 HTML 里注入 JS，**其他域名解密一点用都没有**。
+#     channels.weixin.qq.com 的 HTML 里注入 JS。
+#   · 直播 .flv 地址在 *.wxlivecdn.com，必须解密这一层才看得到；回放媒体
+#     （finder.video.qq.com）不需要解密，靠 JSBridge 与播放进度判断。
 #   · 全量解密会把用户所有站点（含内网业务系统、WebSocket 长连接）都拖过
 #     mitmproxy，上游证书链不完整就直接失败（实测 bg.yjj.gxzf.gov.cn 的
 #     websocket 一直报 Unhandled error，v10.events.data.microsoft.com 报
 #     unable to get local issuer certificate）。
 #   · 隧道转发的域名 addon 看不到，但我们本来也不需要看。
 # 想临时放开（排查用）可以设环境变量 WX_SNIFF_ALLOW_HOSTS。
+# modified: 直播地址在 wxlivecdn 上；只解密页面域名会让直播嗅探静默失效。
+# 使用锚定正则，避免 channels.weixin.qq.com.example.net 也被解密。
 ALLOW_HOSTS = os.environ.get(
-    "WX_SNIFF_ALLOW_HOSTS", r".*channels\.weixin\.qq\.com.*")
+    "WX_SNIFF_ALLOW_HOSTS",
+    r"^(?:channels\.weixin\.qq\.com|(?:[a-z0-9-]+\.)*wxlivecdn\.com)(?::\d+)?$")
 
 REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 # 已知的、自带 mitmdump 的抓包工具（按优先级找）
@@ -89,7 +94,8 @@ def write_proxy(enable, server, override=None):
     """override=None 表示不动；传空字符串则显式清空（还原时要能把注入的值抹掉）"""
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY, 0, winreg.KEY_SET_VALUE) as k:
         winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, int(enable))
-        if server:
+        # modified: 空串也要写回，否则原来无代理的机器会残留我们的 127.0.0.1:4880
+        if server is not None:
             winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, server)
         if override is not None:
             winreg.SetValueEx(k, "ProxyOverride", 0, winreg.REG_SZ, override)
@@ -185,9 +191,10 @@ def _proc_name(pid):
 
 def kill_pid(pid):
     try:
-        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                       capture_output=True, creationflags=CREATE_NO_WINDOW)
-        return True
+        # modified: taskkill 失败不能谎报成功；否则残留 mitmdump 会继续解密流量
+        result = subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                capture_output=True, creationflags=CREATE_NO_WINDOW)
+        return result.returncode == 0
     except Exception:
         return False
 
@@ -411,8 +418,8 @@ class Sniffer:
         光看数据分不出是谁，所以用"播放器有没有真的去拉这个媒体"当判据。
         列表里的视频只加载封面图，不会触发 mp4 的 Range 请求。
 
-        现在的主判据换成了播放进度上报（见 _refresh_playing）：它比媒体请求更准，
-        而且不需要解密媒体域名 —— 只解密 channels.weixin.qq.com 就够了。
+        现在的主判据换成了播放进度上报（见 _refresh_playing）：它比媒体请求更准。
+        回放媒体域名不需要解密；直播 CDN 单独放行是为了抓 .flv 地址。
         媒体请求这条留作补充，两条任一对上就算"播过"。
         """
         try:
@@ -491,7 +498,14 @@ class Sniffer:
             order = []
             removed = 0
             for h in self.hits:
-                key = (h.get("kind"), (h.get("name") or "").strip(), h.get("filesize") or 0)
+                # modified: 直播没有标题和大小，旧键会把所有直播塌缩成一条；
+                # 直播用稳定的媒体 key，回放才用「名称 + 大小」。
+                if h.get("kind") == "live":
+                    key = ("live", media_key(h.get("url") or ""), 0)
+                else:
+                    name = (h.get("name") or "").strip()
+                    key = (("replay", name, h.get("filesize") or 0) if name
+                           else ("url", media_key(h.get("url") or ""), 0))
                 if key in keep:
                     # 挪到末尾：后来的这条地址最新（旧 token 可能已过期）
                     order.remove(key)
@@ -532,6 +546,12 @@ class Sniffer:
 
     # --- 开始
     def start(self):
+        # modified: 已在嗅探时幂等返回；进程已死则先还原旧代理再重启，
+        # 避免把“指向自己的死代理”误当成用户原代理备份。
+        if self.state == "嗅探中":
+            if self.proc and self.proc.poll() is None:
+                return True, "已在嗅探中"
+            self.stop(restore=True)
         ok, why = self.precheck()
         if not ok:
             self.state, self.msg = "失败", why
@@ -568,7 +588,7 @@ class Sniffer:
                 [exe, "-s", addon,
                  "--listen-host", "127.0.0.1",        # 只监听本机，别暴露成局域网代理
                  "-p", str(self.port),
-                 # 只解密视频号页面域名，其余流量原样隧道转发
+                 # 只解密视频号页面与直播 CDN，其余流量原样隧道转发
                  "--set", "allow_hosts=" + ALLOW_HOSTS,
                  # 不校验上游证书：我们只是转发，校验失败反而会掐断本来能用的连接
                  "--set", "ssl_insecure=true",
@@ -605,7 +625,18 @@ class Sniffer:
                 json.dump(self._backup, f, ensure_ascii=False)
         except Exception:
             pass
-        write_proxy(1, f"127.0.0.1:{self.port}", sanitize_override(ovr))
+        try:
+            write_proxy(1, f"127.0.0.1:{self.port}", sanitize_override(ovr))
+        except Exception as exc:
+            # modified: 接管失败要收掉已启动的 mitmdump，不能让半套嗅探常驻
+            self._kill_proc()
+            self._backup = None
+            try:
+                os.remove(BACKUP_PATH)
+            except Exception:
+                pass
+            self.state, self.msg = "失败", f"接管系统代理失败：{exc}"
+            return False, self.msg
 
         self.state = "嗅探中"
         self.msg = "已接管系统代理，去微信里打开回放页面（会注入 JS 抓 decode_key）"
@@ -697,20 +728,31 @@ class Sniffer:
             pass
 
     def stop(self, restore=True):
-        if restore:
-            # 内存里没备份不代表磁盘上没有（进程重启过、或上一轮没收尾），
-            # 所以无条件再读一次磁盘 —— 否则代理会一直指着已经死掉的端口，
-            # 表现就是"所有网页都打不开"。
-            if self._backup:
-                self._release_proxy()
+        # modified: 还原代理失败也必须继续杀进程/复位状态，不能留下半套嗅探
+        restore_failed = False
+        try:
+            if restore:
+                # 内存里没备份不代表磁盘上没有（进程重启过、或上一轮没收尾），
+                # 所以无条件再读一次磁盘。
+                if self._backup:
+                    self._release_proxy()
+                else:
+                    try:
+                        restored = restore_stale_proxy()
+                        if not restored and os.path.isfile(BACKUP_PATH):
+                            restore_failed = True
+                    except Exception:
+                        restore_failed = True
+        except Exception:
+            restore_failed = True
+        finally:
+            self._kill_proc()
+            if restore_failed:
+                self.state = "已中断"
+                self.msg = "嗅探已停止，但系统代理还原失败，请检查代理设置"
             else:
-                try:
-                    restore_stale_proxy()
-                except Exception:
-                    pass
-        self._kill_proc()
-        self.state, self.msg = "空闲", ""
-        return True
+                self.state, self.msg = "空闲", ""
+        return not restore_failed
 
     def status(self):
         alive = bool(self.proc and self.proc.poll() is None)
@@ -781,15 +823,13 @@ def restore_stale_proxy():
     try:
         with open(BACKUP_PATH, "r", encoding="utf-8") as f:
             b = json.load(f)
-        # 备份是自己的嗅探端口 → 一律关掉代理，不能还原成一个孤儿代理
-        if b.get("ours"):
-            write_proxy(0, b.get("server", ""), b.get("override", ""))
-        else:
-            server, enable = b.get("server", ""), b.get("enable", 0)
-            parsed = parse_server(server)
-            if enable and parsed and not port_alive(*parsed):
-                enable = 0
-            write_proxy(enable, server, b.get("override", ""))
+        # modified: ours 备份里保存的仍是用户原代理，按 enable 原样恢复；
+        # 只有原代理端口已死才关闭，不能直接把用户的代理配置关掉。
+        server, enable = b.get("server", ""), b.get("enable", 0)
+        parsed = parse_server(server)
+        if enable and parsed and not port_alive(*parsed):
+            enable = 0
+        write_proxy(enable, server, b.get("override", ""))
         os.remove(BACKUP_PATH)
         return True
     except Exception:

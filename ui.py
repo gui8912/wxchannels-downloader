@@ -234,9 +234,11 @@ const $ = id => document.getElementById(id);
 const pad = n => String(n).padStart(2, "0");
 const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const fmt = s => { s = Math.max(0, s|0); return pad(Math.floor(s/3600))+":"+pad(Math.floor(s%3600/60))+":"+pad(s%60); };
-const size = b => b > 1073741824 ? (b/1073741824).toFixed(2)+" GB"
-              : b > 1048576 ? (b/1048576).toFixed(1)+" MB" : (b/1024).toFixed(0)+" KB";
+// modified: 数字字段统一兜底，缺字段时不再渲染 NaN KB / 00:00:00
+const num = v => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+const fmt = s => { s = Math.max(0, num(s)|0); return pad(Math.floor(s/3600))+":"+pad(Math.floor(s%3600/60))+":"+pad(s%60); };
+const size = b => { b = num(b); return b > 1073741824 ? (b/1073741824).toFixed(2)+" GB"
+              : b > 1048576 ? (b/1048576).toFixed(1)+" MB" : (b/1024).toFixed(0)+" KB"; };
 
 /* ---------- 通用 ---------- */
 function toast(msg, type){
@@ -436,19 +438,22 @@ function renderHits(raw){
   const checked = new Set([...tb.querySelectorAll(".pick:checked")].map(c => c.value));
   tb.innerHTML = "";
   hits.forEach(h => {
+    // modified: id 必须是正整数，不能把 tasks/sniff 文件里的脏字符串拼进 HTML/onclick
+    const id = Number(h.id);
+    if (!Number.isInteger(id) || id <= 0) return;
     const tr = document.createElement("tr");
-    const on = checked.has(String(h.id)) ? " checked" : "";
+    const on = checked.has(String(id)) ? " checked" : "";
     const joined = h.status === "已入队";
-    tr.innerHTML = '<td><input type="checkbox" class="pick" value="'+h.id+'"'+on+'></td>'+
+    tr.innerHTML = '<td><input type="checkbox" class="pick" value="'+id+'"'+on+'></td>'+
       "<td>"+esc(h.t||"")+"</td>"+
       "<td>"+kindTag(h)+"</td>"+
-      '<td><input type="text" class="hname" data-id="'+h.id+'" value="'+esc(h.name)+'" placeholder="点这里填名称"></td>'+
+      '<td><input type="text" class="hname" data-id="'+id+'" value="'+esc(h.name)+'" placeholder="点这里填名称"></td>'+
       '<td><span class="tag">'+hitInfo(h)+"</span></td>"+
       '<td><span class="tag">'+esc(h.status||"")+"</span></td>"+
-      '<td><button class="mini'+(joined?" ghost":"")+'" onclick="recHit('+h.id+')"'+
+      '<td><button class="mini'+(joined?" ghost":"")+'" onclick="recHit('+id+')"'+
         (joined?' title="已经入过队了。再点会另外再下一份（文件名自动加序号）"':' title="加入下载队列"')+'>'+
         (h.kind==="replay"?"入队下载":"入队录制")+
-      '</button> <button class="mini ghost" onclick="delHit('+h.id+')" title="删除这条结果">✕</button></td>';
+      '</button> <button class="mini ghost" onclick="delHit('+id+')" title="删除这条结果">✕</button></td>';
     tb.appendChild(tr);
   });
   tb.querySelectorAll(".hname").forEach(inp => {
@@ -495,7 +500,10 @@ function taskAction(t){
   return "ended";                  // 失败/已停止/已中断/已取消 → 可继续
 }
 function opHTML(t){
-  const k = taskAction(t), id = t.id;
+  // modified: 只接受整数 id，防止被篡改的 tasks.json 注入内联事件
+  const id = Number(t.id);
+  if (!Number.isInteger(id) || id <= 0) return "";
+  const k = taskAction(t);
   if (k === "stop")
     return '<button class="mini danger" onclick="stopTask('+id+')">■ 停止</button>';
   if (k === "busy")
@@ -524,8 +532,11 @@ function renderTasks(tasks){
     taskSig = sig;
     const tb = $("tasks"); tb.innerHTML = "";
     tasks.forEach(t => {
+      // modified: 非整数 id 直接不建行，避免 tr.id / onclick 被脏数据注入
+      const id = Number(t.id);
+      if (!Number.isInteger(id) || id <= 0) return;
       const tr = document.createElement("tr");
-      tr.id = "t-" + t.id;
+      tr.id = "t-" + id;
       tr.innerHTML = '<td><span data-k="q"></span></td>'+
         '<td><span class="st" data-k="st"></span></td>'+
         '<td><span data-k="name"></span><span class="note" data-k="note"></span></td>'+
@@ -537,9 +548,13 @@ function renderTasks(tasks){
     $("empty-tasks").style.display = tasks.length ? "none" : "";
   }
   tasks.forEach(t => {
-    const tr = $("t-" + t.id); if (!tr) return;
+    const id = Number(t.id);
+    if (!Number.isInteger(id) || id <= 0) return;
+    const tr = $("t-" + id); if (!tr) return;
     const q = tr.querySelector('[data-k=q]');
-    q.innerHTML = t.qpos ? '<span class="qpos">' + t.qpos + "</span>" : "";
+    const qpos = Number(t.qpos);
+    q.innerHTML = Number.isInteger(qpos) && qpos > 0
+      ? '<span class="qpos">' + qpos + "</span>" : "";
     const st = tr.querySelector('[data-k=st]');
     st.textContent = t.status;
     st.className = "st " + (ST_CLASS[t.status] || "");
@@ -551,11 +566,14 @@ function renderTasks(tasks){
                              : /断点|还没开播|中断|未下载|停止/.test(t.note || t.err || "") ? " warn" : "");
     tr.querySelector('[data-k=el]').textContent = fmt(t.elapsed);
     const sz = tr.querySelector('[data-k=sz]');
-    if (t.kind === "replay" && t.total)
-      sz.innerHTML = size(t.bytes) + " / " + size(t.total) + "　" + (t.pct||0).toFixed(0) +
-        '%<div class="bar"><i style="width:' + Math.min(100,t.pct||0) + '%"></i></div>';
-    else
+    if (t.kind === "replay" && num(t.total)) {
+      // modified: pct 统一转数字，避免字符串字段触发 toFixed 异常并误报“断线”
+      const pct = Math.min(100, Math.max(0, num(t.pct)));
+      sz.innerHTML = size(t.bytes) + " / " + size(t.total) + "　" + pct.toFixed(0) +
+        '%<div class="bar"><i style="width:' + pct + '%"></i></div>';
+    } else {
       sz.textContent = size(t.bytes);
+    }
     const op = tr.querySelector('[data-k=op]');
     const want = taskAction(t) + ":" + (t.has_mp4 ? 1 : 0);
     if (op.dataset.kind !== want){ op.dataset.kind = want; op.innerHTML = opHTML(t); }

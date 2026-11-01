@@ -24,10 +24,17 @@ PORT_FILE = os.path.join(APP_DIR, "bridge_port.json")
 PORT = int(os.environ.get("WX_BRIDGE_PORT", "18002"))
 MAX_BODY = 4 * 1024 * 1024
 MAX_BRIDGE_FILE = 24 * 1024 * 1024      # 原始记录超过这个大小就滚存一份
+# modified: 只接受视频号页面回传，不能再对任意网页开放 CORS 写入口
+ALLOWED_ORIGINS = {"https://channels.weixin.qq.com"}
+ALLOWED_ORIGINS.update(
+    x.strip() for x in os.environ.get("WX_BRIDGE_ALLOW_ORIGIN", "").split(",")
+    if x.strip()
+)
 # 必须是 RLock：handle_payload 持锁时会调 _append，而 _append 自己也要拿锁，
 # 普通 Lock 在这里会直接把自己锁死。
 _lock = threading.RLock()
 _stats = {"count": 0, "hits": 0, "last_cmd": "", "pings": 0, "last_ping": ""}
+_server = None
 
 
 def _rotate(path, limit):
@@ -53,6 +60,14 @@ def _append(path, rec):
                 f.write(line)
     except Exception:
         pass
+
+
+def _int(value, default=0):
+    """modified: 不能因为 width='auto' 这类脏字段丢掉整条命中。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 def _find(obj, out, meta=None, depth=0):
@@ -105,8 +120,8 @@ def _find(obj, out, meta=None, depth=0):
                             "objectid": m.get("objectid", ""),
                             "size": obj.get("file_size") or obj.get("fileSize") or 0,
                             "duration": obj.get("video_play_len") or obj.get("duration") or 0,
-                            "width": int(obj.get("width") or 0),
-                            "height": int(obj.get("height") or 0)})
+                            "width": _int(obj.get("width") or 0),
+                            "height": _int(obj.get("height") or 0)})
         for v in obj.values():
             _descend(v, out, m, depth)
     elif isinstance(obj, list):
@@ -281,27 +296,62 @@ def reparse(path=None):
 
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 10                    # modified: 半截请求最多占线程 10 秒
+
     def log_message(self, *a):
         pass
 
+    def _host_ok(self):
+        # modified: Host 必须指向本机实际监听端口，防 DNS rebinding
+        host = (self.headers.get("Host") or "").strip().lower()
+        port = self.server.server_port
+        return host in (f"127.0.0.1:{port}", f"localhost:{port}")
+
+    def _origin(self):
+        return (self.headers.get("Origin") or "").strip().rstrip("/")
+
+    def _origin_ok(self):
+        return self._origin() in ALLOWED_ORIGINS
+
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # modified: 只回白名单 Origin，不再使用通配符 *
+        origin = self._origin()
+        if origin in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        # 新版 Chromium 对 HTTPS 页面访问本机 HTTP 会发 Private Network 预检
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+
+    def _deny(self):
+        self.close_connection = True
+        self.send_response(403)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_OPTIONS(self):
         # 页面用 Content-Type: application/json，浏览器会先发预检
+        if not self._host_ok() or not self._origin_ok():
+            self._deny()
+            return
         self.send_response(200)
         self._cors()
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_POST(self):
+        # modified: 写入口同时校验 Host、Origin 和固定路径 /add
+        if (not self._host_ok() or not self._origin_ok()
+                or self.path.split("?")[0] != "/add"):
+            self._deny()
+            return
         try:
             n = int(self.headers.get("Content-Length", 0))
         except Exception:
             n = 0
         if n <= 0 or n > MAX_BODY:
+            self.close_connection = True
             self.send_response(200)
             self._cors()
             self.send_header("Content-Type", "application/json")
@@ -309,14 +359,15 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"ok":false}')
             return
         try:
-            payload = json.loads(self.rfile.read(n).decode("utf-8", "ignore"))
-        except Exception:
-            payload = {}
-        added = 0
-        try:
+            raw = self.rfile.read(n)
+            if len(raw) != n:
+                raise ValueError("incomplete body")
+            payload = json.loads(raw.decode("utf-8", "ignore"))
+            if not isinstance(payload, dict):
+                payload = {}
             added = handle_payload(payload)
         except Exception:
-            pass
+            added = 0
         body = json.dumps({"ok": True, "hits": added}).encode()
         self.send_response(200)
         self._cors()
@@ -326,6 +377,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self._host_ok():
+            self._deny()
+            return
         # /ping：注入脚本一装上就打一张图片过来，用来确认"页面确实重新加载了、
         # 钩子确实进去了"。没有它，抓不到数据时无法区分是没刷新还是没注入。
         if self.path.startswith("/ping"):
@@ -347,15 +401,24 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class BridgeServer(ThreadingHTTPServer):
+    # modified: Windows 下 SO_REUSEADDR 会把“已占用端口”误判为可绑定
+    allow_reuse_address = False
+    daemon_threads = True
+
+
 def start(port=PORT):
     """启动接收服务（后台线程），返回实际端口；失败返回 None
 
     实际端口要落盘：注入的 JS 跑在 mitmdump 的独立进程里，拿不到这里的变量，
     端口一旦被占用改用 18003，脚本还发到 18002 就全丢了。
     """
+    global _server
+    if _server is not None:
+        return _server.server_port
     for p in range(port, port + 8):
         try:
-            srv = ThreadingHTTPServer(("127.0.0.1", p), Handler)
+            srv = BridgeServer(("127.0.0.1", p), Handler)
         except OSError:
             continue
         try:
@@ -363,8 +426,15 @@ def start(port=PORT):
                 json.dump({"port": p}, f)
         except Exception:
             pass
+        _server = srv
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         return p
+    # modified: 全部失败时清掉旧端口文件，避免页面把数据发给别的本地程序
+    try:
+        if os.path.isfile(PORT_FILE):
+            os.remove(PORT_FILE)
+    except Exception:
+        pass
     return None
 
 

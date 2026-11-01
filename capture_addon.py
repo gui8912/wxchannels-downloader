@@ -14,6 +14,7 @@ import os
 import re
 import threading
 import time
+import urllib.parse
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(APP_DIR, "sniffed.jsonl")
@@ -24,7 +25,6 @@ ALL = os.path.join(APP_DIR, "sniffed_all.jsonl")
 PLAYED = os.path.join(APP_DIR, "played.jsonl")
 _SEEN_URL = set()
 
-LIVE_HOST = "wxlivecdn.com"
 MEDIA_HOSTS = ("finder.video.qq.com", "mpvideo.qpic.cn", "video.qq.com")
 MAX_JSON = 4 * 1024 * 1024      # 只看 4MB 以内的响应，避免把视频流读进内存
 MAX_DBG = 40                    # 调试转储最多留 40 份，别把磁盘塞满
@@ -55,8 +55,15 @@ def _append_all(url, method="GET"):
 
 
 def _is_live(url):
+    # modified: 按主机名判断，不能只做字符串包含，否则 ...wxlivecdn.com.evil 也会命中
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except Exception:
+        host = ""
     low = url.lower()
-    return LIVE_HOST in low or (".flv" in low and "txsecret" in low)
+    live_host = host == "wxlivecdn.com" or host.endswith(".wxlivecdn.com")
+    qq_flv = host == "qq.com" or host.endswith(".qq.com")
+    return live_host or (qq_flv and ".flv" in low and "txsecret" in low)
 
 
 def _is_media(url):
@@ -102,8 +109,11 @@ def _record_playing(url):
     _append(PLAYED, {"t": round(time.time(), 3), "key": key, "url": url[:400]})
 
 
-def _walk(obj, out, meta):
+def _walk(obj, out, meta, depth=0):
     """递归找同时带 decode_key 和 url 的节点，顺便继承标题/作者"""
+    # modified: 限制递归深度，避免恶意/异常 JSON 触发 RecursionError 吞掉整批响应
+    if depth > 14:
+        return
     if isinstance(obj, dict):
         m = dict(meta)
         for k in ("nickname", "author", "username"):
@@ -139,15 +149,15 @@ def _walk(obj, out, meta):
                     "height": obj.get("height") or 0,
                 })
         for v in obj.values():
-            _descend(v, out, m)
+            _descend(v, out, m, depth)
     elif isinstance(obj, list):
         for v in obj:
-            _descend(v, out, meta)
+            _descend(v, out, meta, depth)
 
 
-def _descend(v, out, meta):
+def _descend(v, out, meta, depth):
     if isinstance(v, (dict, list)):
-        _walk(v, out, meta)
+        _walk(v, out, meta, depth + 1)
     elif isinstance(v, str) and len(v) > 16 and v[:1] in "{[":
         # 微信用 resp_json 这种字段装 JSON 字符串，得再解一层
         try:
@@ -155,22 +165,25 @@ def _descend(v, out, meta):
         except Exception:
             return
         if isinstance(sub, (dict, list)):
-            _walk(sub, out, meta)
+            _walk(sub, out, meta, depth + 1)
 
 
 def _dump_debug(url, body):
     """把含 decode_key 的响应原样存一份，便于分析真实结构"""
     try:
         os.makedirs(DBG_DIR, exist_ok=True)
+        # modified: 只清理本工具生成的 *.bin，不能误删 _debug 下别人的文件
         olds = sorted(
-            (os.path.join(DBG_DIR, f) for f in os.listdir(DBG_DIR)),
+            (os.path.join(DBG_DIR, f) for f in os.listdir(DBG_DIR)
+             if f.lower().endswith(".bin")),
             key=lambda p: os.path.getmtime(p))
         for p in olds[:max(0, len(olds) - MAX_DBG + 1)]:
             try:
                 os.remove(p)
             except Exception:
                 pass
-        stamp = time.strftime("%H%M%S") + "_%03d" % (int(time.time() * 1000) % 1000)
+        # modified: 用纳秒后缀避免同一毫秒内两次转储互相覆盖
+        stamp = time.strftime("%H%M%S") + f"_{time.time_ns() % 1_000_000_000:09d}"
         name = os.path.join(DBG_DIR, stamp + ".bin")
         with open(name, "wb") as f:
             f.write(body)
@@ -377,7 +390,7 @@ def _inject_hosts():
     gzip + CSP 的页面，把 127.0.0.1 配进来），不必每次都拿真微信试。
     """
     raw = os.environ.get("WX_INJECT_HOSTS", "channels.weixin.qq.com")
-    return [h.strip() for h in raw.split(",") if h.strip()]
+    return [h.strip().lower() for h in raw.split(",") if h.strip()]
 
 
 INJECT_HOSTS = _inject_hosts()
@@ -387,7 +400,12 @@ NO_INJECT = os.environ.get("WX_NO_INJECT", "") not in ("", "0", "false")
 
 
 def _should_inject(url):
-    return any(h in url for h in INJECT_HOSTS)
+    # modified: 按主机名精确匹配，不能在仿冒域名的 URL 里也注入 JSBridge 钩子
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except Exception:
+        return False
+    return host in INJECT_HOSTS
 
 
 def _inject(flow):

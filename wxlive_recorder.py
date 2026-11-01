@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-视频号直播 / 回放下载器  v5.0
+视频号直播 / 回放下载器  v5.6.0
 ============================================================================
 · 直播：FLV 边拉边写，断流自动重连，录完转封装 MP4
 · 回放：HTTP Range 下载（可续传）→ 官方 WASM 解密 → MP4 / MP3 / 封面
@@ -12,6 +12,7 @@
 """
 import atexit
 import json
+import math
 import os
 import re
 import shutil
@@ -20,6 +21,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -30,8 +32,8 @@ import sniffer as sniff_mod
 import ui as ui_mod
 import wxdecrypt
 
-VERSION = "5.5.0"
-BUILD = "2026-10-29"
+VERSION = "5.6.0"
+BUILD = "2026-11-01"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
@@ -60,9 +62,50 @@ PAUSED = "已暂停"          # 不是终态：随时可以「继续」捡起来
 # 用户下完一个回放再点一次「入队下载」，拿回来的是那个已完成的旧任务，
 # 界面提示"已加入队列"但队列里根本没东西，什么都不会发生。
 ACTIVE_STATES = ("排队中", "等待开播", "录制中", "下载中", "收尾中", PAUSED)
+_SAVE_LOCK = threading.Lock()       # modified: 串行化 config/tasks 的落盘与备份
+# modified: /api/open 只允许打开产出文件，禁止借“打开目录”执行任意程序
+OPEN_FILE_EXTS = (".mp4", ".mp3", ".flv", ".m4a", ".jpg", ".jpeg", ".png", ".webp")
 
 
 # ----------------------------------------------------------------- 通用
+# modified: 统一做容错类型转换，避免 tasks.json 一条脏数据让整个程序起不来
+def _as_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _as_float(value, default=0.0):
+    try:
+        number = float(value)
+        return number if number == number and abs(number) != float("inf") else default
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+# modified: 原子落盘统一入口；唯一临时名 + fsync，避免并发写出半截 JSON
+def _write_json(path, data, backup=False):
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        if backup and os.path.isfile(path):
+            try:
+                shutil.copy2(path, path + ".bak")
+            except Exception:
+                pass
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
 def load_config():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -74,17 +117,12 @@ def load_config():
 
 def save_config(data):
     """写配置：先合并再落盘，避免把一个字段写成空就把别的字段抹掉"""
-    cur = load_config()
-    cur.update({k: v for k, v in (data or {}).items() if v is not None})
-    tmp = CONFIG_PATH + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cur, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, CONFIG_PATH)
-    except Exception:
+    # modified: 配置和任务共用写盘锁，且使用唯一临时文件
+    with _SAVE_LOCK:
+        cur = load_config()
+        cur.update({k: v for k, v in (data or {}).items() if v is not None})
         try:
-            if os.path.isfile(tmp):
-                os.remove(tmp)
+            _write_json(CONFIG_PATH, cur)
         except Exception:
             pass
 
@@ -133,16 +171,18 @@ def safe_filename(s, limit=80):
     """
     s = str(s or "")
     s = s.replace("\u3000", " ")                      # 全角空格
-    s = re.sub(r"[\r\n\t]+", " ", s)
+    # modified: 清掉所有控制字符；只替换 \r\n\t 时会留下 \x00 等非法路径字符
+    s = re.sub(r"[\x00-\x1f\x7f]+", " ", s)
     s = re.sub(r"\s{2,}", " ", s)                     # 连续空白压成一个
     s = re.sub(r'[\\/:*?"<>|]', "_", s)
     s = re.sub(r"_{2,}", "_", s)
     s = s.strip(" ._-")
     if len(s) > limit:
         s = s[:limit].rstrip(" ._-")
-    # Windows 保留名
-    if s.upper().split(".")[0] in ("CON", "PRN", "AUX", "NUL") or \
-            re.match(r"^(COM|LPT)[1-9]$", s.upper()):
+    # modified: 保留名按主文件名判断，COM1.txt / LPT9.mp4 同样不能落盘
+    stem = os.path.splitext(s)[0].upper()
+    if stem in ("CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$") or \
+            re.match(r"^(COM|LPT)[1-9]$", stem):
         s = "_" + s
     return s
 
@@ -427,6 +467,8 @@ class Downloader(threading.Thread):
         self.last_data = time.time()
         self.reconnects = 0
         self._stop = threading.Event()
+        # modified: 416 只重置一次，避免远端异常时无限“清零再请求”
+        self._resume_reset_used = False
 
     def log(self, msg):
         self.logs.put(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -435,9 +477,12 @@ class Downloader(threading.Thread):
         self._stop.set()
 
     def run(self):
-        attempt = 0
+        # modified: 重试按“连续无进展”计数，成功续传不会消耗重试次数
+        no_progress = 0
+        total_attempts = 0
         while not self._stop.is_set():
-            attempt += 1
+            total_attempts += 1
+            before = os.path.getsize(self.part) if os.path.isfile(self.part) else 0
             try:
                 self._fetch_once()
                 if self._stop.is_set():
@@ -452,13 +497,25 @@ class Downloader(threading.Thread):
                 if self._stop.is_set():
                     self.state = "已停止"
                     return
+                after = os.path.getsize(self.part) if os.path.isfile(self.part) else 0
+                no_progress = 1 if after > before else no_progress + 1
                 self.error = str(e)[:200]
+                # modified: 403/404/410 是地址失效，不是网络抖动，重试没有意义
+                if re.search(r"\bHTTP\s+(401|403|404|410)\b", self.error):
+                    self.state = "地址失效"
+                    self.error = f"{self.error}（地址已过期，需要重新嗅探）"
+                    return
                 self.reconnects += 1
-                self.log(f"下载中断：{e}，2 秒后重试（第 {attempt} 次）")
+                self.log(f"下载中断：{e}，2 秒后重试"
+                         f"（共 {total_attempts} 次，连续无进展 {no_progress} 次）")
                 self._stop.wait(2)
-                if attempt >= 8:
+                if no_progress >= 8:
                     self.state = "失败"
-                    self.error = f"重试 {attempt} 次仍失败：{self.error}"
+                    self.error = f"连续 {no_progress} 次没有进展：{self.error}"
+                    return
+                if total_attempts >= 40:
+                    self.state = "失败"
+                    self.error = f"累计尝试 {total_attempts} 次仍未完成：{self.error}"
                     return
 
     def _fetch_once(self):
@@ -468,11 +525,34 @@ class Downloader(threading.Thread):
         if start:
             headers["Range"] = "bytes=%d-" % start
         req = urllib.request.Request(self.url, headers=headers)
-        # 优先直连（本机系统代理会拖慢大文件），直连不通再退回默认 opener
+        # 优先直连（本机系统代理会拖慢大文件），直连不通再退回默认 opener。
+        # modified: HTTPError 是服务端明确答案，不能再拿它去走系统代理重试一遍。
         try:
-            resp = _DIRECT_OPENER.open(req, timeout=30)
-        except Exception:
-            resp = urllib.request.urlopen(req, timeout=30)
+            try:
+                resp = _DIRECT_OPENER.open(req, timeout=30)
+            except urllib.error.HTTPError:
+                raise
+            except Exception:
+                resp = urllib.request.urlopen(req, timeout=30)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 416 and start:
+                m = re.search(r"/(\d+)\s*$",
+                              exc.headers.get("Content-Range", "") or "")
+                remote_total = int(m.group(1)) if m else 0
+                if remote_total:
+                    self.total = remote_total
+                    if start == remote_total:
+                        self.log("断点文件已达到远端总大小，直接视为下载完成")
+                        self.state = "下载完成"
+                        return
+                if not self._resume_reset_used:
+                    self._resume_reset_used = True
+                    self.log("断点位置无效（HTTP 416），清空临时文件后从头下载")
+                    with open(self.part, "wb"):
+                        pass
+                    self.bytes = 0
+                    return self._fetch_once()
+            raise IOError("HTTP %s" % exc.code)
         try:
             code = resp.getcode()
             if code == 206:
@@ -672,22 +752,26 @@ def _to_disk(t):
 
 
 def save_tasks():
-    with LOCK:
-        data = {"version": VERSION,
-                "next_id": STATE["next_id"],
-                "queue": list(STATE["queue"]),
-                "tasks": [_to_disk(t) for t in STATE["tasks"]]}
-    tmp = TASKS_PATH + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, TASKS_PATH)
-    except Exception:
+    # modified: 快照和落盘放在同一把写锁内，防止旧快照后写覆盖新快照
+    with _SAVE_LOCK:
+        with LOCK:
+            data = {"version": VERSION,
+                    "next_id": STATE["next_id"],
+                    "queue": list(STATE["queue"]),
+                    "tasks": [_to_disk(t) for t in STATE["tasks"]]}
         try:
-            if os.path.isfile(tmp):
-                os.remove(tmp)
+            _write_json(TASKS_PATH, data, backup=True)
         except Exception:
             pass
+
+
+def _read_json_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
 
 
 def load_tasks():
@@ -698,55 +782,89 @@ def load_tasks():
     """
     if not os.path.isfile(TASKS_PATH):
         return
-    try:
-        with open(TASKS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
+    # modified: 主文件损坏时回退 .bak；旧版直接 return，会让整张任务表静默消失
+    data = _read_json_file(TASKS_PATH)
+    if data is None:
+        data = _read_json_file(TASKS_PATH + ".bak")
+        if data is not None:
+            add_log("tasks.json 损坏，已从 .bak 恢复任务列表")
+    if data is None:
         return
-    if not isinstance(data, dict):
-        return
-    tasks = data.get("tasks") or []
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list):
+        tasks = []
     max_id = 0
     restored = 0
+    skipped = 0
+    seen_ids = set()
     for d in tasks:
-        if not isinstance(d, dict) or "id" not in d:
+        # modified: 每条独立容错，坏记录跳过，不再让一条脏数据拖垮整个启动
+        if not isinstance(d, dict):
+            skipped += 1
             continue
-        t = dict(d)
-        t.setdefault("kind", "live")
-        t.setdefault("dir", DEFAULT_OUTDIR)
-        t.setdefault("note", "")
-        t["rec"] = None
-        t["finishing"] = False
-        t["probe_t"] = 0.0
-        t["t0"] = 0.0
-        t["elapsed"] = float(t.get("elapsed") or 0)
-        # 旧版本会把"预期输出路径"直接写进 mp4 字段，重启后看着像已完成。
-        # 一律以磁盘为准：文件不在就当没有。
-        for k in ("mp4", "mp3"):
-            if t.get(k) and not os.path.isfile(t[k]):
-                t[k] = ""
-        part = (t.get("flv") or "") + ".part"
-        t["has_part"] = os.path.isfile(part)
-        if t.get("status") in RUNNING_STATES:
-            t["status"] = "已中断"
-            t["note"] = "程序重启导致中断" + (
-                "，断点已保留，可点「继续」" if t["has_part"] else "")
-        # 排队中的保持排队；蹲守的必须还原成"等待开播"。
-        # 这里以前一律写成"排队中"，蹲守任务重启后就退化成普通任务 ——
-        # 调度线程拿着还没开播的地址直接开录，几秒后必然报"失败"，白丢一次蹲守。
-        if t.get("status") == PAUSED:
-            t["paused"] = True
-        elif t.get("status") in ("排队中", "等待开播"):
-            t["status"] = "等待开播" if t.get("wait_live") else "排队中"
-        STATE["tasks"].append(t)
-        max_id = max(max_id, int(t.get("id") or 0))
-        restored += 1
-    STATE["next_id"] = max(int(data.get("next_id") or 0), max_id + 1)
+        try:
+            tid = _as_int(d.get("id"), 0)
+            if tid <= 0 or tid in seen_ids:
+                skipped += 1
+                continue
+            t = dict(d)
+            t["id"] = tid
+            for key, default in (("name", ""), ("url", ""), ("dir", DEFAULT_OUTDIR),
+                                 ("flv", ""), ("mp4", ""), ("mp3", ""),
+                                 ("err", ""), ("note", ""), ("created", ""),
+                                 ("decode_key", ""), ("status", "已中断"),
+                                 ("kind", "live")):
+                if not isinstance(t.get(key), str):
+                    t[key] = default
+            if not t["url"].lower().startswith("http") or not t["flv"]:
+                skipped += 1
+                continue
+            if t["kind"] not in ("live", "replay"):
+                t["kind"] = "live"
+            known_states = set(FINAL_STATES) | set(ACTIVE_STATES) | {"已暂停"}
+            if t["status"] not in known_states:
+                t["status"] = "已中断"
+            for key in ("elapsed", "bytes", "total", "reconnects", "limit_min"):
+                t[key] = _as_float(t.get(key), 0.0)
+            # modified: 布尔字段同样归一化，避免字符串 "false" 被当成 True
+            for key in ("audio", "silence_stop", "wait_live", "paused"):
+                t[key] = bool(t.get(key))
+            t["rec"] = None
+            t["finishing"] = False
+            t["probe_t"] = 0.0
+            t["t0"] = 0.0
+            # 旧版本会把"预期输出路径"直接写进 mp4 字段，重启后看着像已完成。
+            # 一律以磁盘为准：文件不在就当没有。
+            for k in ("mp4", "mp3"):
+                if t.get(k) and not os.path.isfile(t[k]):
+                    t[k] = ""
+            part = t["flv"] + ".part"
+            t["has_part"] = os.path.isfile(part)
+            if t["status"] in RUNNING_STATES:
+                t["status"] = "已中断"
+                t["note"] = "程序重启导致中断" + (
+                    "，断点已保留，可点「继续」" if t["has_part"] else "")
+            # 排队中的保持排队；蹲守的必须还原成"等待开播"。
+            if t["status"] == PAUSED:
+                t["paused"] = True
+            elif t["status"] in ("排队中", "等待开播"):
+                t["status"] = "等待开播" if t.get("wait_live") else "排队中"
+            STATE["tasks"].append(t)
+            seen_ids.add(tid)
+            max_id = max(max_id, tid)
+            restored += 1
+        except Exception:
+            skipped += 1
+    STATE["next_id"] = max(_as_int(data.get("next_id"), 0), max_id + 1)
     # 队列只保留真正还在排队的，其余按 id 顺序补回去。
-    # 「等待开播」必须一起算：蹲守任务重启后就是这个状态，只认"排队中"的话
-    # 它会被留在队列外 —— 界面上写着"等待开播"，但调度线程根本看不到它，
-    # 蹲守就这么悄无声息地丢了。
-    q = [i for i in (data.get("queue") or []) if task_by_id(i)]
+    raw_queue = data.get("queue")
+    if not isinstance(raw_queue, list):
+        raw_queue = []
+    q = []
+    for value in raw_queue:
+        tid = _as_int(value, 0)
+        if tid and task_by_id(tid):
+            q.append(tid)
     waiting = [t["id"] for t in STATE["tasks"]
                if t.get("status") in ("排队中", "等待开播")]
     seen = set()
@@ -760,6 +878,8 @@ def load_tasks():
             seen.add(i)
     if restored:
         add_log(f"已恢复上次的 {restored} 条任务记录")
+    if skipped:
+        add_log(f"⚠ 已跳过 {skipped} 条损坏或不完整的任务记录")
 
 
 # ----------------------------------------------------------------- 任务生命周期
@@ -780,6 +900,14 @@ def new_task(name, url, outdir, limit_min=0, audio=False, silence_stop=False,
     if is_replay:
         # 回放是有限长度的文件，蹲守/静音/限时这些直播专属选项对它没有意义
         wait_live, silence_stop, limit_min = False, False, 0
+
+    # modified: 在入口统一校验时长，避免脏参数拖到调度线程才报 TypeError
+    try:
+        limit_min = float(limit_min or 0)
+    except (TypeError, ValueError):
+        raise ValueError("录制时长必须是数字（分钟）")
+    if not math.isfinite(limit_min) or limit_min < 0:
+        raise ValueError("录制时长必须是大于等于 0 的分钟数")
 
     with LOCK:
         if dedup:
@@ -848,44 +976,49 @@ def new_task(name, url, outdir, limit_min=0, audio=False, silence_stop=False,
 
 
 def start_task(t):
-    t["t0"] = time.time()
-    t["err"] = ""
-    t["note"] = ""
-    t["paused"] = False
-    free = disk_free(t["dir"])
-    if 0 <= free < 2 * 1024 ** 3:
-        add_log(f"⚠ #{t['id']} 磁盘只剩 {free / 1024 ** 3:.1f} GB，长录制可能装不下")
+    # modified: 状态复核、active 占用和线程启动放进同一临界区，堵住“取消后仍开录”竞态
+    with LOCK:
+        if t.get("status") not in ("排队中", "等待开播"):
+            return False
+        t["t0"] = time.time()
+        t["err"] = ""
+        t["note"] = ""
+        t["paused"] = False
+        free = disk_free(t["dir"])
+        if 0 <= free < 2 * 1024 ** 3:
+            add_log(f"⚠ #{t['id']} 磁盘只剩 {free / 1024 ** 3:.1f} GB，长录制可能装不下")
 
-    # 回放：走下载器（可续传），不是直播那种无限录制
-    if t["kind"] == "replay":
-        d = Downloader(t["url"], t["flv"], t.get("decode_key", ""))
-        t["rec"] = d
-        t["status"] = "下载中"
-        d.start()
+        # 回放：走下载器（可续传），不是直播那种无限录制
+        if t["kind"] == "replay":
+            d = Downloader(t["url"], t["flv"], t.get("decode_key", ""))
+            t["rec"] = d
+            t["status"] = "下载中"
+            STATE["active"] = t["id"]
+            d.start()
+            add_log(f"⬇ 开始下载回放 #{t['id']}　{os.path.basename(t['flv'])}")
+            return True
+
+        # 已有内容（暂停后继续）就接着往后录，不要覆盖掉暂停前那一段
+        prev = os.path.getsize(t["flv"]) if os.path.isfile(t["flv"]) else 0
+        r = Recorder(t["url"], t["flv"], append=prev > 10240)
+        t["rec"] = r
+        t["status"] = "录制中"
         STATE["active"] = t["id"]
-        add_log(f"⬇ 开始下载回放 #{t['id']}　{os.path.basename(t['flv'])}")
-        return
+        r.start()
+        add_log(f"▶ 开始录制 #{t['id']}　{os.path.basename(t['flv'])}"
+                + (f"（已有 {fmt_size(prev)}，接着录）" if prev > 10240 else ""))
 
-    # 已有内容（暂停后继续）就接着往后录，不要覆盖掉暂停前那一段
-    prev = os.path.getsize(t["flv"]) if os.path.isfile(t["flv"]) else 0
-    r = Recorder(t["url"], t["flv"], append=prev > 10240)
-    t["rec"] = r
-    t["status"] = "录制中"
-    r.start()
-    STATE["active"] = t["id"]
-    add_log(f"▶ 开始录制 #{t['id']}　{os.path.basename(t['flv'])}"
-            + (f"（已有 {fmt_size(prev)}，接着录）" if prev > 10240 else ""))
+        if t["silence_stop"]:
+            def on_silent():
+                add_log(f"⚠ #{t['id']} 静音超过 {SILENCE_SECONDS // 60} 分钟，自动停止")
+                stop_task(t["id"], "静音自动停止")
 
-    if t["silence_stop"]:
-        def on_silent():
-            add_log(f"⚠ #{t['id']} 静音超过 {SILENCE_SECONDS // 60} 分钟，自动停止")
-            stop_task(t["id"], "静音自动停止")
-
-        threading.Thread(
-            target=silence_monitor,
-            args=(t["url"], SILENCE_SECONDS, on_silent,
-                  lambda: (t.get("rec") is not r) or (not r.is_alive())),
-            daemon=True).start()
+            threading.Thread(
+                target=silence_monitor,
+                args=(t["url"], SILENCE_SECONDS, on_silent,
+                      lambda: (t.get("rec") is not r) or (not r.is_alive())),
+                daemon=True).start()
+        return True
 
 
 def stop_task(tid, reason=""):
@@ -894,31 +1027,34 @@ def stop_task(tid, reason=""):
     以前只处理"正在跑"和"等待开播"两种情况 —— 「排队中」的任务点停止毫无反应，
     因为它既没有线程、状态又不是"等待开播"，调度线程一有空就把它捞起来开录。
     """
-    t = task_by_id(tid)
-    if not t:
-        return {"ok": False, "msg": "任务不存在"}
-    st = t.get("status")
-    if st in FINAL_STATES:
-        return {"ok": True, "msg": "任务已结束"}
-
-    r = t.get("rec")
-    if st == "收尾中":
-        # 收尾里已经在 join 线程 / 转封装了，这时候把它标成"已取消"会让
-        # 收尾线程结束时的判断全部落空，文件白处理一遍
-        return {"ok": True, "msg": "正在收尾，请稍等"}
-    if st in RUNNING_STATES and r and r.is_alive():
-        r.stop()
-        add_log(f"■ 停止 #{t['id']}" + (f"（{reason}）" if reason else ""))
-        return {"ok": True}
-
-    # 还没跑起来的：直接从队列摘掉
     with LOCK:
+        t = task_by_id(tid)
+        if not t:
+            return {"ok": False, "msg": "任务不存在"}
+        st = t.get("status")
+        if st in FINAL_STATES:
+            return {"ok": True, "msg": "任务已结束"}
+
+        r = t.get("rec")
+        if st == "收尾中":
+            # 收尾里已经在 join 线程 / 转封装了，这时候把它标成"已取消"会让
+            # 收尾线程结束时的判断全部落空，文件白处理一遍
+            return {"ok": True, "msg": "正在收尾，请稍等"}
+        # modified: active 任务只发停止信号，状态必须留给 manager 收尾；
+        # 旧代码在线程刚好退出的瞬间会写“已取消”却不释放 active，整个队列停摆。
+        if STATE["active"] == t["id"]:
+            if r:
+                r.stop()
+            add_log(f"■ 停止 #{t['id']}" + (f"（{reason}）" if reason else ""))
+            return {"ok": True}
+
+        # 还没跑起来的：直接从队列摘掉
         try:
             STATE["queue"].remove(t["id"])
         except ValueError:
             pass
-    t["status"] = "已取消"
-    t["note"] = reason or "已取消"
+        t["status"] = "已取消"
+        t["note"] = reason or "已取消"
     add_log(f"已取消 #{t['id']}　{t['name']}" + (f"（{reason}）" if reason else ""))
     save_tasks()
     return {"ok": True}
@@ -1046,7 +1182,13 @@ def dedup_tasks(apply=True):
     """
     groups = {}
     for t in list(STATE["tasks"]):
-        key = (t.get("kind"), t.get("name"), int(t.get("total") or 0))
+        # modified: 判重键加入实际输出路径，避免同名同大小但不同文件的记录被误删，
+        # 留下磁盘文件却没有任何任务入口。
+        try:
+            output = os.path.normcase(os.path.abspath(t.get("flv") or ""))
+        except Exception:
+            output = t.get("flv") or ""
+        key = (t.get("kind"), t.get("name"), _as_int(t.get("total"), 0), output)
         groups.setdefault(key, []).append(t)
 
     rank = {"录制中": 0, "下载中": 0, "收尾中": 0, "已完成": 1, "排队中": 2,
@@ -1154,13 +1296,31 @@ def _finish_replay(t):
             add_log(f"　 加密文件保留在 {os.path.basename(enc)}，拿到 key 后可手动解密")
             return
         add_log(f"　 解密中（decode_key={key}）…")
-        res = wxdecrypt.decrypt(enc, out, key)
+        # modified: 先写 .part，成功后再原子改名；失败不会留下半截最终 mp4
+        decrypt_tmp = out + ".part"
+        res = wxdecrypt.decrypt(enc, decrypt_tmp, key)
         if not res.get("ok"):
+            try:
+                if os.path.isfile(decrypt_tmp):
+                    os.remove(decrypt_tmp)
+            except Exception:
+                pass
             t["status"] = "失败"
             t["err"] = res.get("reason", "解密失败")
             t["note"] = t["err"]
             add_log(f"✘ #{t['id']} {t['err']}")
             add_log(f"　 加密文件保留在 {os.path.basename(enc)}")
+            return
+        try:
+            os.replace(decrypt_tmp, out)
+        except Exception as e:
+            try:
+                if os.path.isfile(decrypt_tmp):
+                    os.remove(decrypt_tmp)
+            except Exception:
+                pass
+            t["status"], t["err"] = "失败", f"解密文件改名失败：{e}"
+            t["note"] = t["err"]
             return
         t["mp4"] = out
         try:
@@ -1364,14 +1524,13 @@ def manager():
                 if not STATE["queue"]:
                     continue
                 tid = STATE["queue"][0]
-            t = task_by_id(tid)
-            if not t or t.get("status") in FINAL_STATES:
-                with LOCK:
+                t = task_by_id(tid)
+                if not t or t.get("status") in FINAL_STATES:
                     try:
                         STATE["queue"].remove(tid)
                     except ValueError:
                         pass
-                continue
+                    continue
             if t["wait_live"] and t["status"] == "等待开播":
                 if time.time() - t["probe_t"] < PROBE_INTERVAL:
                     _rotate_queue(tid)      # 还没到探测时间，先给后面的让路
@@ -1383,12 +1542,35 @@ def manager():
                     _rotate_queue(tid)
                     continue
                 add_log(f"✔ #{tid} 检测到可以拉流了，开始录制")
-            with LOCK:
-                try:
-                    STATE["queue"].remove(tid)
-                except ValueError:
-                    pass
-            start_task(t)
+            # modified: 出队、状态切换和线程启动原子化；启动失败会标失败并释放队列
+            try:
+                with LOCK:
+                    if tid not in STATE["queue"]:
+                        continue
+                    if t.get("status") not in ("排队中", "等待开播"):
+                        try:
+                            STATE["queue"].remove(tid)
+                        except ValueError:
+                            pass
+                        continue
+                    start_task(t)
+                    try:
+                        STATE["queue"].remove(tid)
+                    except ValueError:
+                        pass
+            except Exception as e:
+                with LOCK:
+                    t["status"] = "失败"
+                    t["err"] = f"启动失败：{e}"
+                    t["note"] = t["err"]
+                    t["finishing"] = False
+                    if STATE["active"] == tid:
+                        STATE["active"] = None
+                    try:
+                        STATE["queue"].remove(tid)
+                    except ValueError:
+                        pass
+                add_log(f"✘ #{tid} 启动失败：{e}")
             save_tasks()
         except Exception as e:
             add_log(f"调度异常：{e}")
@@ -1406,9 +1588,12 @@ def api_sniff_start():
 
 
 def api_sniff_stop():
-    SNIFFER.stop(restore=True)
-    add_log("已停止嗅探，系统代理已恢复")
-    return {"ok": True, "msg": "已停止嗅探，系统代理已恢复"}
+    restored = SNIFFER.stop(restore=True)
+    if restored:
+        add_log("已停止嗅探，系统代理已恢复")
+        return {"ok": True, "msg": "已停止嗅探，系统代理已恢复"}
+    add_log("⚠ 已停止嗅探，但系统代理还原失败，请检查 Internet 选项")
+    return {"ok": False, "msg": "嗅探已停止，但系统代理还原失败，请检查代理设置"}
 
 
 def sniff_watch():
@@ -1424,6 +1609,8 @@ def sniff_watch():
     while True:
         time.sleep(0.5)
         try:
+            # modified: 不依赖浏览器轮询触发自愈；mitmdump 崩了也要及时还原系统代理
+            SNIFFER.status()
             if SNIFFER.state != "嗅探中":
                 started = None
                 continue
@@ -1475,11 +1662,16 @@ def _allowed_roots():
 
 def _is_allowed(path):
     try:
-        p = os.path.normcase(os.path.abspath(path))
+        # modified: 解析 junction/symlink，防止白名单目录里的链接指向外部程序
+        p = os.path.normcase(os.path.realpath(path))
     except Exception:
         return False
     for r in _allowed_roots():
-        if p == r or p.startswith(r.rstrip("\\/") + os.sep):
+        try:
+            root = os.path.normcase(os.path.realpath(r))
+        except Exception:
+            root = r
+        if p == root or p.startswith(root.rstrip("\\/") + os.sep):
             return True
     return False
 
@@ -1489,13 +1681,15 @@ def open_path(path, reveal=False):
     if not path:
         return False, "没有指定路径"
     path = os.path.normpath(path)
+    # modified: 拒绝 UNC/设备路径，避免打开时触发 SMB 认证或设备名解析
+    if path.startswith("\\\\") or path.startswith("//") or path.startswith("\\?\\"):
+        return False, "不支持网络共享或设备路径"
     if not os.path.exists(path):
         return False, f"路径不存在：{path}"
     is_dir = os.path.isdir(path)
-    # 目录一律放行：用户完全可能把保存位置设在别的盘（E:\课程），
-    # 而白名单只认任务/配置里出现过的目录，那样点"打开目录"会被莫名拒绝。
-    # 文件则必须落在白名单里 —— 这才是真正有风险的那一半（防止被诱导
-    # 打开本机任意可执行文件）。
+    # modified: 文件只允许播放器/图片等产出类型，堵住 /api/open 执行 exe/bat/lnk
+    if not is_dir and os.path.splitext(path)[1].lower() not in OPEN_FILE_EXTS:
+        return False, "这个文件类型不允许由本工具打开"
     if not is_dir and not _is_allowed(path):
         return False, "这个文件不在允许打开的目录范围内"
     try:
@@ -1553,22 +1747,36 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     # -- 同源校验 ------------------------------------------------------
+    def _host_ok(self):
+        """modified: 先钉死 Host，DNS rebinding 页面无法靠 same-origin 混进来。"""
+        host = (self.headers.get("Host") or "").strip().lower()
+        return host in (f"127.0.0.1:{PORT}", f"localhost:{PORT}")
+
     def _same_origin(self, strict=False):
         """挡掉外部网页对本机端口的乱调。
 
         127.0.0.1 上的服务不是"外网访问不到"就安全：任意网页都能
         用 <img src>/fetch 打到本机端口。所以要校验请求来源。
         """
+        # modified: Host 是硬门禁；Sec-Fetch-Site 只作辅助信号，不能单独放行
+        if not self._host_ok():
+            return False
         site = (self.headers.get("Sec-Fetch-Site") or "").lower()
-        if site in ("same-origin", "none"):
-            return True
-        origin = self.headers.get("Origin") or ""
+        origin = (self.headers.get("Origin") or "").rstrip("/")
         ref = self.headers.get("Referer") or ""
-        pat = re.compile(r"^https?://(127\.0\.0\.1|localhost)(:\d+)?(/|$)")
+        # modified: 只接受本工具固定端口的页面，不再放行 localhost 任意端口
+        allowed = {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}
         if origin:
-            return bool(pat.match(origin))
+            return origin in allowed
         if ref:
-            return bool(pat.match(ref))
+            try:
+                parsed = urllib.parse.urlsplit(ref)
+                base = f"{parsed.scheme}://{parsed.netloc}"
+            except Exception:
+                return False
+            return base in allowed
+        if site in ("same-origin", "none"):
+            return not strict
         return not strict      # 地址栏直接敲（GET 导航）没有 Origin/Referer
 
     def _json_body(self):
@@ -1576,16 +1784,31 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length") or 0)
         except Exception:
             n = 0
-        if n <= 0 or n > 8 * 1024 * 1024:
+        if n <= 0:
+            return {}
+        if n > 8 * 1024 * 1024:
+            # modified: 超大请求直接断开，避免残留 body 污染 keep-alive 下一请求
+            self.close_connection = True
             return {}
         try:
-            data = json.loads(self.rfile.read(n).decode("utf-8", "ignore") or "{}")
+            raw = self.rfile.read(n)
+            if len(raw) != n:
+                self.close_connection = True
+                return {}
+            data = json.loads(raw.decode("utf-8", "ignore") or "{}")
             return data if isinstance(data, dict) else {}
         except Exception:
+            self.close_connection = True
             return {}
 
     # -- GET ----------------------------------------------------------
     def do_GET(self):
+        # modified: 所有入口先校验 Host，堵住 DNS rebinding 读写通道
+        if not self._host_ok():
+            self.close_connection = True
+            self._send(403, json.dumps({"ok": False, "msg": "host not allowed"},
+                                       ensure_ascii=False))
+            return
         path = self.path.split("?")[0]
         qs = urllib.parse.parse_qs(self.path.split("?")[1] if "?" in self.path else "")
         try:
@@ -1616,7 +1839,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- POST ---------------------------------------------------------
     def do_POST(self):
+        # modified: 拒绝时直接关连接，避免未消费的请求体串到下一次 keep-alive
         if not self._same_origin(strict=True):
+            self.close_connection = True
             self._send(403, json.dumps({"ok": False, "msg": "forbidden"},
                                        ensure_ascii=False))
             return
@@ -1898,65 +2123,82 @@ def api_restart():
 def serve():
     from_restart = "--from-restart" in sys.argv
     no_browser = "--no-browser" in sys.argv
-
-    threading.Thread(target=manager, daemon=True).start()
-
-    add_log(f"视频号下载器 v{VERSION} 启动")
-    add_log(f"ffmpeg: {find_ffmpeg()}")
-    ok_node, node_msg = wxdecrypt.available()
-    add_log(f"回放解密：{'就绪' if ok_node else '不可用 — ' + node_msg}")
-
-    if sniff_mod.restore_stale_proxy():
-        add_log("上次退出时系统代理没恢复，已自动修好")
-
-    # 回放的 decode_key 只能从页面的 WeixinJSBridge 拿，起一个接收端
-    try:
-        bp = bridge_server.start()
-        if bp:
-            add_log(f"JSBridge 接收端：127.0.0.1:{bp}")
-        else:
-            add_log("⚠ JSBridge 接收端端口都被占用，回放可能抓不到 decode_key")
-    except Exception as e:
-        add_log(f"⚠ JSBridge 接收端启动失败：{e}")
-
-    # 嗅探统计：上次遗留了多少结果
-    try:
-        left = len(SNIFFER.hits)
-        if left:
-            add_log(f"嗅探结果列表里有上次留下的 {left} 条，可直接使用")
-    except Exception:
-        pass
-
-    load_tasks()
-    threading.Thread(target=sniff_watch, daemon=True).start()
-    atexit.register(lambda: (save_tasks(), SNIFFER.stop(restore=True)))
-
-    # 端口：先看有没有旧实例
     port = PORT
+
+    # modified: 单实例检查必须在 load_tasks/manager/bridge 之前。
+    # 旧代码先启动调度再查实例，第二个进程会抢同一个任务并覆盖 tasks.json。
     if not from_restart:
         info = running_instance(port)
-        if info and info["version"] != VERSION:
-            print(f"检测到旧版本 v{info['version']} 正在 {port} 端口运行。"
-                  f"请在页面上点「重启服务」，或先关闭它再启动本版本 v{VERSION}。")
-        elif info:
+        if info:
             url = f"http://127.0.0.1:{port}/"
+            if info["version"] != VERSION:
+                print(f"检测到旧版本 v{info['version']} 正在 {port} 端口运行。"
+                      f"请在页面上点「重启服务」，或先关闭它再启动本版本 v{VERSION}。")
+                return
             print("已经有一个在跑，直接复用：", url)
             if not no_browser:
                 webbrowser.open(url)
             return
 
+    # modified: 先占住固定端口再初始化；不再自动换到 8766 起第二个实例
     httpd = None
-    for i in range(40 if from_restart else 10):
+    last_error = ""
+    attempts = 160 if from_restart else 1
+    for _ in range(attempts):
         try:
             httpd = RecorderServer(("127.0.0.1", port), Handler)
             break
-        except OSError:
-            # 重启时旧进程还占着端口，等它退干净
-            time.sleep(0.4 if from_restart else 0.05)
-            port = port if from_restart else port + 1
+        except OSError as exc:
+            last_error = str(exc)
+            if not from_restart:
+                break
+            time.sleep(0.25)
     if httpd is None:
-        print("端口都被占用了，退出")
+        print(f"无法监听 127.0.0.1:{port}：{last_error or '端口被占用'}。"
+              "请关闭占用该端口的程序后重试。")
         return
+
+    try:
+        add_log(f"视频号下载器 v{VERSION} 启动")
+        add_log(f"ffmpeg: {find_ffmpeg()}")
+        ok_node, node_msg = wxdecrypt.available()
+        add_log(f"回放解密：{'就绪' if ok_node else '不可用 — ' + node_msg}")
+
+        if sniff_mod.restore_stale_proxy():
+            add_log("上次退出时系统代理没恢复，已自动修好")
+
+        # 回放的 decode_key 只能从页面的 WeixinJSBridge 拿，起一个接收端
+        try:
+            bp = bridge_server.start()
+            if bp:
+                add_log(f"JSBridge 接收端：127.0.0.1:{bp}")
+            else:
+                add_log("⚠ JSBridge 接收端端口都被占用，回放可能抓不到 decode_key")
+        except Exception as e:
+            add_log(f"⚠ JSBridge 接收端启动失败：{e}")
+
+        try:
+            load_tasks()
+        except Exception as e:
+            add_log(f"⚠ 恢复任务列表失败，已按空列表启动：{e}")
+
+        # 嗅探统计：上次遗留了多少结果
+        try:
+            left = len(SNIFFER.hits)
+            if left:
+                add_log(f"嗅探结果列表里有上次留下的 {left} 条，可直接使用")
+        except Exception:
+            pass
+
+        threading.Thread(target=manager, daemon=True).start()
+        threading.Thread(target=sniff_watch, daemon=True).start()
+        atexit.register(lambda: (save_tasks(), SNIFFER.stop(restore=True)))
+    except Exception:
+        try:
+            httpd.server_close()
+        except Exception:
+            pass
+        raise
 
     url = f"http://127.0.0.1:{port}/"
     add_log(f"服务就绪：{url}")
