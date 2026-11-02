@@ -1467,6 +1467,11 @@ def _finish_live(t):
                 f"{os.path.getsize(mp4) / 1048576:.1f} MB")
         if t["audio"]:
             mp3 = mp4[:-4] + ".mp3"
+            # modified: ffmpeg 一律带 -y，同名 MP3 会被直接盖掉。mp4 已经避让过，
+            # 但用户手工删过 mp4、或上次只留了 mp3 时仍会撞上，这里补一道。
+            if os.path.exists(mp3):
+                mp3 = _uniq_path(mp3)
+                add_log(f"　 同名 MP3 已存在，改用 {os.path.basename(mp3)}")
             ok2, err2 = ffmpeg_to_mp3(mp4, mp3)
             if ok2 and os.path.isfile(mp3):
                 t["mp3"] = mp3
@@ -1475,6 +1480,8 @@ def _finish_live(t):
             else:
                 add_log(f"✘ #{t['id']} MP3 导出失败：{err2[:150]}")
         cover = mp4[:-4] + ".jpg"
+        if os.path.exists(cover):          # modified: 同上，别覆盖已有封面
+            cover = _uniq_path(cover)
         if ffmpeg_cover(mp4, cover):
             add_log(f"　 封面 {os.path.basename(cover)}")
         t["status"] = "已完成"
