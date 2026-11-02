@@ -24,6 +24,8 @@ _audit_tests.py
 _uitest.mjs
 _sorttest.mjs
 _shot.mjs
+_shot_focus.mjs
+_focus*.png
 _filtertest.mjs
 _datetest.mjs
 _onlyplaying.py

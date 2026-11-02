@@ -11,6 +11,7 @@ HTML = r"""<!DOCTYPE html>
 <title>视频号直播 / 回放下载器</title>
 <style>
 *{box-sizing:border-box}
+html{color-scheme:dark}   /* 让数字框上下箭头、下拉框、滚动条按深色渲染，不再黑乎乎看不清 */
 body{margin:0;padding:20px 18px 60px;background:#0d1117;color:#e6edf3;
      font:14px/1.6 "Microsoft YaHei UI","PingFang SC",system-ui,sans-serif}
 .wrap{max-width:1000px;margin:0 auto}
@@ -25,7 +26,8 @@ textarea,input[type=text],input[type=number],select{width:100%;background:#0d111
   border:1px solid #30363d;border-radius:6px;padding:8px 11px;font:12.5px/1.5 Consolas,monospace;outline:none}
 select{font-family:"Microsoft YaHei UI",sans-serif;padding:7px 9px}
 textarea{height:68px;resize:vertical;word-break:break-all}
-textarea:focus,input:focus,select:focus{border-color:#1f6feb;box-shadow:0 0 0 3px rgba(31,111,235,.15)}
+textarea:focus,input[type=text]:focus,select:focus{border-color:#1f6feb;box-shadow:0 0 0 3px rgba(31,111,235,.15)}
+input[type=number]:focus{border-color:#484f58;box-shadow:none}
 .hint{font-size:12px;color:#8b949e;margin-top:7px}
 .hint.warn{color:#d29922}.hint.bad{color:#f85149}.hint.ok{color:#3fb950}
 .row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
@@ -220,7 +222,7 @@ textarea.slim{height:52px}
            title="静音超过这么多分钟就自动停止。0 = 不启用。以前写死 5 分钟，容易在安静的直播里误停">
       静音
       <input type="number" id="silence" value="0" min="0" max="720" step="1"
-             style="width:64px;text-align:center"> 分钟自动停</label>
+             style="width:70px;padding:8px 4px 8px 6px;text-align:center"> 分钟自动停</label>
     <label style="margin:0;display:flex;align-items:center;gap:5px;cursor:pointer">
       <input type="checkbox" id="waitlive"> 未开播就蹲守（20 秒探测）</label>
     <label style="margin:0;display:flex;align-items:center;gap:5px;cursor:pointer"
