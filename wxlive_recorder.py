@@ -34,7 +34,7 @@ import sniffer as sniff_mod
 import ui as ui_mod
 import wxdecrypt
 
-VERSION = "5.7.1"
+VERSION = "5.7.2"
 BUILD = "2026-11-02"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -227,14 +227,16 @@ def safe_filename(s, limit=80):
     return s
 
 
-def build_basename(name, with_date=False):
+def build_basename(name, with_date=False, fallback="视频号直播"):
     """文件名主干。
 
     默认**不带日期** —— 课程名本来就长，再挂个 _2026-10-29 更难认，
     同一门课分几次下载还会因为跨天而散成好几份。
     只有用户主动勾了「文件名加日期」才追加，且按要求直接接在尾部，不加分隔符。
+
+    fallback 是名字为空时的兜底（回放要用「视频号回放」，不能一律叫直播）。
     """
-    base = safe_filename(name) or "视频号直播"
+    base = safe_filename(name) or fallback
     if with_date:
         base += time.strftime("%Y-%m-%d")
     return base
@@ -967,7 +969,8 @@ def new_task(name, url, outdir, limit_min=0, audio=False, silence_stop=False,
         except Exception as e:
             raise ValueError(f"保存目录不可用：{e}")
 
-        base = build_basename(name, with_date)
+        base = build_basename(name, with_date,
+                              "视频号回放" if is_replay else "视频号直播")
 
         # 同名任务可能同时排队，此时文件还没落地，只看 os.path.exists 会撞车
         used = set()
@@ -996,8 +999,10 @@ def new_task(name, url, outdir, limit_min=0, audio=False, silence_stop=False,
                 i += 1
 
         t = {
-            "id": STATE["next_id"], "name": safe_filename(name) or
-            ("视频号回放" if is_replay else "视频号直播"),
+            # modified: 任务名直接用文件名主干。以前这里另算一遍 safe_filename，
+            # 勾了「文件名加日期」时只有磁盘上的文件带日期，列表里还是老名字，
+            # 看起来就像勾选没生效。
+            "id": STATE["next_id"], "name": base,
             "url": url, "dir": outdir, "flv": work, "mp4": "", "mp3": "",
             "err": "", "note": "",
             "kind": "replay" if is_replay else "live",
@@ -2082,7 +2087,17 @@ class Handler(BaseHTTPRequestHandler):
                          h.get("kind", "live"), h.get("decode_key", ""),
                          with_date=opts["with_date"])
             SNIFFER.mark(body.get("id"), "已入队")
-            return {"ok": True, "id": t["id"], "msg": f"已加入队列 #{t['id']}"}
+            # modified: 说清楚"现在就在录"还是"排在后面"。队列是串行的，
+            # 同一时刻只录一个；以前一律回"已加入队列"，看起来像点了没反应。
+            if t.get("status") == "等待开播":
+                msg = f"已加入队列 #{t['id']}，开播后自动开始"
+            elif STATE["active"] == t["id"]:
+                msg = f"已开始录制 #{t['id']}"
+            elif STATE["active"]:
+                msg = f"已加入队列 #{t['id']}，#{STATE['active']} 结束后自动开始"
+            else:
+                msg = f"已加入队列 #{t['id']}，正在开始录制"
+            return {"ok": True, "id": t["id"], "msg": msg}
 
         if p == "/api/hit/rename":
             ok = SNIFFER.rename(body.get("id"), body.get("name", ""))

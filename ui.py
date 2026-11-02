@@ -209,13 +209,10 @@ textarea.slim{height:52px}
   <label>保存设置</label>
   <div class="row">
     <div><label>保存目录</label><input type="text" id="dir" onchange="saveDir()"></div>
-    <div style="flex:0 0 200px;min-width:150px"><label>课程名称（决定文件名）</label>
-      <input type="text" id="cname" placeholder="留空 = 视频号直播"></div>
     <div style="flex:0 0 90px;min-width:74px"><label>限时(分)</label>
       <input type="number" id="limit" value="0" min="0" step="5"></div>
     <div style="flex:0 0 auto"><button onclick="openDir()">打开目录</button></div>
   </div>
-  <div class="hint" id="fname">文件名预览：—</div>
   <div class="row" style="margin-top:10px;gap:18px">
     <label style="margin:0;display:flex;align-items:center;gap:5px;cursor:pointer">
       <input type="checkbox" id="audio"> 同时导出 MP3</label>
@@ -227,13 +224,19 @@ textarea.slim{height:52px}
            title="默认不加日期。勾上后在名称末尾追加当天日期，如「课程名2026-10-29」">
       <input type="checkbox" id="datetag"> 文件名加日期</label>
   </div>
+  <div class="hint">以上是所有任务共用的选项。文件名取自各自的名称：嗅探结果在列表里逐条改，手动填地址的填在最下面那张卡片里。</div>
 </div>
 
 <!-- 手动地址 -->
 <div class="card">
   <label>手动填地址（不走嗅探时用）</label>
   <textarea id="url" placeholder="直播流：https://pull-m1.wxlivecdn.com/trtc_xxx/orig_xxx_orig.flv?...&#10;回放：https://finder.video.qq.com/251/20302/stodownload?...（加密的会自动解密）"></textarea>
+  <div class="row" style="margin-top:8px">
+    <div><label>名称（决定文件名）</label>
+      <input type="text" id="cname" placeholder="留空 = 视频号直播"></div>
+  </div>
   <div class="hint" id="exp">链接有效期：—</div>
+  <div class="hint" id="fname">文件名预览：—</div>
   <button class="primary" style="margin-top:12px" onclick="startManual()">▶ 加入队列并开始</button>
 </div>
 </div><!-- /pane-sph -->
@@ -566,7 +569,8 @@ function renderHits(raw){
       '<td><button class="mini'+(joined?" ghost":"")+'"'+((h.expired||joined)?" disabled":"")+
         ' onclick="recHit('+id+')"'+
         (h.expired?' title="地址已过期（预约直播或页面缓存），请刷新直播页重新抓一条"'
-         :(joined?' title="已经入过队了。再点会另外再下一份（文件名自动加序号）"':' title="加入下载队列"'))+'>'+
+         :(joined?' title="已经入过队了。再点会另外再下一份（文件名自动加序号）"'
+           :' title="加入队列并立即开始录制（同一时刻只录一个，其余自动排队）"'))+'>'+
         (h.kind==="replay"?"入队下载":"入队录制")+
       '</button> <button class="mini ghost" onclick="delHit('+id+')" title="删除这条结果">✕</button></td>';
     tb.appendChild(tr);
