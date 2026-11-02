@@ -34,7 +34,7 @@ import sniffer as sniff_mod
 import ui as ui_mod
 import wxdecrypt
 
-VERSION = "5.7.3"
+VERSION = "5.7.4"
 BUILD = "2026-11-02"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -87,7 +87,7 @@ def _ui_port():
 
 PORT = _ui_port()
 PROBE_INTERVAL = 20          # 蹲守模式探测间隔（秒）
-SILENCE_SECONDS = 300        # 静音多久算"没人了"
+SILENCE_DEFAULT_MIN = 5      # modified: 静音自动停的默认分钟数（旧记录/旧前端只给布尔值时用它）
 SNIFF_MAX_SECONDS = 1800     # 嗅探最长挂 30 分钟，之后自动停并还原代理
 STALL_SECONDS = 120          # 直播多久没有新数据算卡死
 DL_STALL_SECONDS = 300       # 下载多久没有新字节算卡死
@@ -122,6 +122,27 @@ def _as_float(value, default=0.0):
         return number if number == number and abs(number) != float("inf") else default
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _silence_minutes(value):
+    """把「静音自动停」的参数归一成分钟数；0 表示关闭。
+
+    modified: 原来是布尔开关、写死 5 分钟，安静一点的直播（整点静默、纯课件页）
+    会被误停。现在由用户在界面上填分钟数：
+      · 数字 > 0  → 按这个分钟数
+      · True      → 旧记录/旧前端，按默认 5 分钟（兼容）
+      · 0 / False / 非法值 → 关闭
+    上限 24 小时，防止手滑填成 100000。
+    """
+    if isinstance(value, bool):
+        return float(SILENCE_DEFAULT_MIN) if value else 0.0
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if n != n or n in (float("inf"), float("-inf")) or n <= 0:
+        return 0.0
+    return min(n, 24 * 60.0)
 
 
 # modified: 原子落盘统一入口；唯一临时名 + fsync，避免并发写出半截 JSON
@@ -885,7 +906,9 @@ def public_task(t):
         "has_mp4": has_mp4, "has_mp3": has_mp3,
         "err": t.get("err", ""), "note": t.get("note", ""),
         "created": t.get("created", ""), "limit_min": t.get("limit_min", 0),
-        "silence_stop": bool(t.get("silence_stop")), "wait_live": bool(t.get("wait_live")),
+        "silence_stop": bool(t.get("silence_stop")),
+        "silence_min": _as_float(t.get("silence_min"), 0),
+        "wait_live": bool(t.get("wait_live")),
         "audio": bool(t.get("audio")), "kind": t.get("kind", "live"),
         "qpos": qpos, "has_part": bool(t.get("has_part")),
         "dir": t.get("dir", ""), "paused": bool(t.get("paused")),
@@ -977,6 +1000,10 @@ def load_tasks():
             # modified: 布尔字段同样归一化，避免字符串 "false" 被当成 True
             for key in ("audio", "silence_stop", "wait_live", "paused"):
                 t[key] = bool(t.get(key))
+            # modified: 老记录只有布尔开关，补一个分钟数，否则启动时那段会回落到默认
+            t["silence_min"] = _as_float(t.get("silence_min"), 0)
+            if t["silence_stop"] and t["silence_min"] <= 0:
+                t["silence_min"] = float(SILENCE_DEFAULT_MIN)
             t["rec"] = None
             t["finishing"] = False
             t["probe_t"] = 0.0
@@ -1045,9 +1072,11 @@ def new_task(name, url, outdir, limit_min=0, audio=False, silence_stop=False,
 
     outdir = (outdir or "").strip() or DEFAULT_OUTDIR
     is_replay = (kind == "replay")
+    # modified: silence_stop 现在装的是分钟数（0=关闭），不再只是布尔值
+    silence_min = _silence_minutes(silence_stop)
     if is_replay:
         # 回放是有限长度的文件，蹲守/静音/限时这些直播专属选项对它没有意义
-        wait_live, silence_stop, limit_min = False, False, 0
+        wait_live, silence_min, limit_min = False, 0.0, 0
 
     # modified: 在入口统一校验时长，避免脏参数拖到调度线程才报 TypeError
     try:
@@ -1113,7 +1142,8 @@ def new_task(name, url, outdir, limit_min=0, audio=False, silence_stop=False,
             "elapsed": 0.0, "bytes": 0, "total": 0, "reconnects": 0,
             "created": time.strftime("%H:%M:%S"), "t0": 0.0,
             "limit_min": float(limit_min or 0), "audio": bool(audio),
-            "silence_stop": bool(silence_stop), "wait_live": bool(wait_live),
+            "silence_stop": silence_min > 0, "silence_min": silence_min,
+            "wait_live": bool(wait_live),
             "rec": None, "probe_t": 0.0, "finishing": False,
             "has_part": os.path.isfile(work + ".part"),
         }
@@ -1159,14 +1189,18 @@ def start_task(t):
         add_log(f"▶ 开始录制 #{t['id']}　{os.path.basename(t['flv'])}"
                 + (f"（已有 {fmt_size(prev)}，接着录）" if prev > 10240 else ""))
 
-        if t["silence_stop"]:
+        if t.get("silence_stop"):
+            # modified: 阈值由任务自带（用户填的分钟数），旧记录没带就用默认 5 分钟
+            minutes = _as_float(t.get("silence_min"), 0) or SILENCE_DEFAULT_MIN
+
             def on_silent():
-                add_log(f"⚠ #{t['id']} 静音超过 {SILENCE_SECONDS // 60} 分钟，自动停止")
+                add_log(f"⚠ #{t['id']} 静音超过 {minutes:g} 分钟，自动停止")
                 stop_task(t["id"], "静音自动停止")
 
+            add_log(f"　 静音 {minutes:g} 分钟自动停已启用")
             threading.Thread(
                 target=silence_monitor,
-                args=(t["url"], SILENCE_SECONDS, on_silent,
+                args=(t["url"], minutes * 60, on_silent,
                       lambda: (t.get("rec") is not r) or (not r.is_alive())),
                 daemon=True).start()
         return True
@@ -2082,7 +2116,7 @@ class Handler(BaseHTTPRequestHandler):
         opts = dict(dir=body.get("dir") or cfg.get("last_dir") or DEFAULT_OUTDIR,
                     limit=body.get("limit", 0),
                     audio=bool(body.get("audio", False)),
-                    silence=bool(body.get("silence", False)),
+                    silence=body.get("silence", 0),
                     wait_live=bool(body.get("wait_live", False)),
                     with_date=bool(body.get("with_date", False)))
 

@@ -216,8 +216,11 @@ textarea.slim{height:52px}
   <div class="row" style="margin-top:10px;gap:18px">
     <label style="margin:0;display:flex;align-items:center;gap:5px;cursor:pointer">
       <input type="checkbox" id="audio"> 同时导出 MP3</label>
-    <label style="margin:0;display:flex;align-items:center;gap:5px;cursor:pointer">
-      <input type="checkbox" id="silence"> 静音 5 分钟自动停</label>
+    <label style="margin:0;display:flex;align-items:center;gap:5px"
+           title="静音超过这么多分钟就自动停止。0 = 不启用。以前写死 5 分钟，容易在安静的直播里误停">
+      静音
+      <input type="number" id="silence" value="0" min="0" max="720" step="1"
+             style="width:64px;text-align:center"> 分钟自动停</label>
     <label style="margin:0;display:flex;align-items:center;gap:5px;cursor:pointer">
       <input type="checkbox" id="waitlive"> 未开播就蹲守（20 秒探测）</label>
     <label style="margin:0;display:flex;align-items:center;gap:5px;cursor:pointer"
@@ -419,7 +422,7 @@ function previewName(){
 }
 function currentOpts(){
   return {dir:$("dir").value.trim(), limit:+$("limit").value||0,
-          audio:$("audio").checked, silence:$("silence").checked,
+          audio:$("audio").checked, silence:+$("silence").value || 0,
           wait_live:$("waitlive").checked, with_date:$("datetag").checked};
 }
 
@@ -868,6 +871,11 @@ $("datetag").addEventListener("change", () => {
   previewName();
 });
 $("dir").addEventListener("change", () => localStorage.setItem("wxlive_dir", $("dir").value));
+$("silence").addEventListener("change", () => localStorage.setItem("wxlive_silence", $("silence").value));
+{
+  const sv = localStorage.getItem("wxlive_silence");
+  if (sv !== null && sv !== "") $("silence").value = sv;
+}
 $("url").value = localStorage.getItem("wxlive_url") || "";
 $("cname").value = localStorage.getItem("wxlive_name") || "";
 $("datetag").checked = localStorage.getItem("wxlive_datetag") === "1";
