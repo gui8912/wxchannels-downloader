@@ -230,6 +230,23 @@ def parse_server(server):
     return None
 
 
+def parse_upstream(server):
+    """把系统代理解析成 mitmproxy 的 upstream 地址。
+
+    # modified: v2rayN / Clash 这类常驻上网代理会一直占着系统代理，
+    # 它不是“别的抓包工具”。嗅探接管代理时应把它当作上游接力，
+    # 否则要么要求用户关掉代理（关了就上不了外网），要么直接拒绝启动。
+    系统代理写成 socks=host:port 时用 socks5 上游，其余按 http 代理处理。
+    """
+    if not server:
+        return ""
+    scheme = "socks5" if "socks" in str(server).lower() else "http"
+    parsed = parse_server(server)
+    if not parsed:
+        return ""
+    return f"{scheme}://{parsed[0]}:{parsed[1]}"
+
+
 # ----------------------------------------------------------------- mitmdump
 def find_mitmdump():
     try:
@@ -264,6 +281,7 @@ class Sniffer:
         self._seen = set()
         self._next_id = 1
         self._backup = None
+        self._upstream = ""          # modified: 接管前的系统代理，作为 mitmproxy 上游接力
         self._locate = 0
         self._lock = threading.Lock()      # 保护 hits / _seen / _locate
         self._io_lock = threading.Lock()   # 保护文件读取位置
@@ -540,8 +558,10 @@ class Sniffer:
         if en:
             parsed = parse_server(srv)
             if parsed and parsed[1] != self.port and port_alive(*parsed):
-                return False, (f"系统代理已被 127.0.0.1:{parsed[1]} 占用"
-                               f"（多半是别的抓包工具正在监听）。请先关掉它的「开始监听」。")
+                # modified: 原逻辑在这里直接拒绝启动，把 v2rayN / Clash 这类
+                # 常驻上网代理误判成“别的抓包工具”。现在只记录上游地址，
+                # 由 start() 以 upstream 模式接力转发，用户不必关掉自己的代理。
+                self._upstream = parse_upstream(srv)
         return True, ""
 
     # --- 开始
@@ -575,45 +595,68 @@ class Sniffer:
         # 不清空 sniffed.jsonl：里面可能是刚解析出来的历史结果，删了就得重刷页面
         # 才能再拿到。重复项靠 _seen 去重（_locate 从 0 开始读）。
 
-        logf = None
-        try:
-            logf = open(os.path.join(APP_DIR, "mitm.log"), "wb")
-            # mitmdump 会继承本进程的 http_proxy/https_proxy 环境变量（WorkBuddy 的
-            # 沙箱代理 127.0.0.1:49333）。那样它会再套一层代理去连上游，而沙箱
-            # 代理返回的证书链它不认，日志里就是 "unable to get local issuer
-            # certificate"，该域名的请求直接失败。所以给它一个干净的直连环境。
-            env = {k: v for k, v in os.environ.items()
-                   if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
-            self.proc = subprocess.Popen(
-                [exe, "-s", addon,
-                 "--listen-host", "127.0.0.1",        # 只监听本机，别暴露成局域网代理
-                 "-p", str(self.port),
-                 # 只解密视频号页面与直播 CDN，其余流量原样隧道转发
-                 "--set", "allow_hosts=" + ALLOW_HOSTS,
-                 # 不校验上游证书：我们只是转发，校验失败反而会掐断本来能用的连接
-                 "--set", "ssl_insecure=true",
-                 "--set", "block_global=false"],
-                stdout=logf, stderr=logf, env=env,
-                creationflags=CREATE_NO_WINDOW)
-        except Exception as e:
-            self.state, self.msg = "失败", f"启动 mitmdump 失败：{e}"
-            return False, self.msg
-        finally:
-            if logf:
-                logf.close()
-
-        # 等端口就绪：必须确认是"我们起的这个进程"在监听
-        for _ in range(40):
-            time.sleep(0.25)
-            if self.proc.poll() is not None:
-                self.state, self.msg = "失败", "mitmdump 启动后立即退出，看 mitm.log"
-                self.proc = None
-                return False, self.msg
-            if port_alive("127.0.0.1", self.port):
-                break
+        # modified: 接管前先看看系统代理是不是被 v2rayN / Clash 之类的
+        # 上网代理占着。是的话让它当上游接力，用户不用关掉自己的代理，
+        # 嗅探期间其它网站也照常能上（隧道流量原样交给上游）。
+        en, srv, _ = read_proxy()
+        parsed = parse_server(srv) if en else None
+        if parsed and parsed[1] != self.port and port_alive(*parsed):
+            self._upstream = parse_upstream(srv)
         else:
-            self.state, self.msg = "失败", f"端口 {self.port} 没起来"
-            self._kill_proc()
+            self._upstream = ""
+
+        # mitmdump 会继承本进程的 http_proxy/https_proxy 环境变量（WorkBuddy 的
+        # 沙箱代理 127.0.0.1:49333）。那样它会再套一层代理去连上游，而沙箱
+        # 代理返回的证书链它不认，日志里就是 "unable to get local issuer
+        # certificate"，该域名的请求直接失败。所以给它一个干净的直连环境。
+        env = {k: v for k, v in os.environ.items()
+               if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
+
+        # modified: 起两次。第一次带上游，起不来就退回直连再试一次 ——
+        # 上游格式不兼容（例如只认 SOCKS）时不能让整次嗅探直接失败。
+        for attempt in (0, 1):
+            cmd = [exe, "-s", addon,
+                   "--listen-host", "127.0.0.1",        # 只监听本机，别暴露成局域网代理
+                   "-p", str(self.port),
+                   # 只解密视频号页面与直播 CDN，其余流量原样隧道转发
+                   "--set", "allow_hosts=" + ALLOW_HOSTS,
+                   # 不校验上游证书：我们只是转发，校验失败反而会掐断本来能用的连接
+                   "--set", "ssl_insecure=true",
+                   "--set", "block_global=false"]
+            if self._upstream:
+                cmd += ["--mode", "upstream:" + self._upstream]
+            logf = None
+            try:
+                logf = open(os.path.join(APP_DIR, "mitm.log"), "wb")
+                self.proc = subprocess.Popen(
+                    cmd, stdout=logf, stderr=logf, env=env,
+                    creationflags=CREATE_NO_WINDOW)
+            except Exception as e:
+                self.state, self.msg = "失败", f"启动 mitmdump 失败：{e}"
+                return False, self.msg
+            finally:
+                if logf:
+                    logf.close()
+
+            # 等端口就绪：必须确认是"我们起的这个进程"在监听
+            for _ in range(40):
+                time.sleep(0.25)
+                if self.proc.poll() is not None:
+                    break
+                if port_alive("127.0.0.1", self.port):
+                    break
+            else:
+                self.state, self.msg = "失败", f"端口 {self.port} 没起来"
+                self._kill_proc()
+                return False, self.msg
+
+            if self.proc and self.proc.poll() is None:
+                break
+            self.proc = None
+            if attempt == 0 and self._upstream:
+                self._upstream = ""
+                continue
+            self.state, self.msg = "失败", "mitmdump 启动后立即退出，看 mitm.log"
             return False, self.msg
 
         # 备份并接管系统代理
@@ -639,7 +682,11 @@ class Sniffer:
             return False, self.msg
 
         self.state = "嗅探中"
-        self.msg = "已接管系统代理，去微信里打开回放页面（会注入 JS 抓 decode_key）"
+        # modified: 明确告诉用户走的是上游接力，不是把原代理关掉
+        self.msg = ("已接管系统代理"
+                    + (f"（上游经 {self._upstream.split('//')[-1]} 转发）"
+                       if self._upstream else "")
+                    + "，去微信里打开回放页面（会注入 JS 抓 decode_key）")
         self.caught = None
         with self._io_lock:
             self._locate = 0

@@ -495,6 +495,22 @@ def _dump_page_error(flow):
         pass
 
 
+def responseheaders(flow):
+    """媒体流必须边收边转。
+
+    # modified: mitmproxy 默认先把整个响应体收完再转发。直播 FLV 是无限流，
+    # 缓冲永远结束不了 —— 播放器一直转圈，每 3 秒重连一次（实测日志里
+    # pull-*.wxlivecdn.com 反复 client disconnect）。这里对直播流和回放媒体
+    # 显式开启流式转发：body 不进内存，边下边给，播放才走得动。
+    """
+    try:
+        url = flow.request.pretty_url
+        if _is_live(url) or _is_media(url):
+            flow.response.stream = True
+    except Exception:
+        pass
+
+
 def response(flow):
     try:
         url = flow.request.pretty_url
