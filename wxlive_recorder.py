@@ -34,7 +34,7 @@ import sniffer as sniff_mod
 import ui as ui_mod
 import wxdecrypt
 
-VERSION = "5.7.2"
+VERSION = "5.7.3"
 BUILD = "2026-11-02"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -181,11 +181,58 @@ def open_stream(url, timeout=15):
         return urllib.request.urlopen(req, timeout=timeout), "系统代理"
 
 
+_FFVER = {}
+
+
+def ffmpeg_version(exe):
+    """ffmpeg 主版本号；认不出来的按 0 算。
+
+    老式每日构建打的是 "ffmpeg version N-92722-gf22fcd4483"（2018 年），
+    没有数字版本号，这里按 4.0 计 —— 它确实属于那个年代。
+    """
+    key = os.path.normcase(os.path.abspath(exe)) if exe else ""
+    if key in _FFVER:
+        return _FFVER[key]
+    ver = 0.0
+    if exe:
+        try:
+            r = subprocess.run([exe, "-hide_banner", "-version"], capture_output=True,
+                               text=True, errors="ignore", timeout=8,
+                               creationflags=CREATE_NO_WINDOW)
+            out = (r.stdout or "") + (r.stderr or "")
+            m = re.search(r"ffmpeg version (\d+)\.(\d+)", out)
+            if m:
+                ver = float(m.group(1)) + float(m.group(2)) / 100.0
+            elif re.search(r"ffmpeg version N-\d+", out):
+                ver = 4.0
+            else:
+                # git 构建按日期排序：2022-07-04-git-… → 2022.07
+                m = re.search(r"ffmpeg version (\d{4})-(\d{2})-\d{2}", out)
+                if m:
+                    ver = float(m.group(1)) + float(m.group(2)) / 100.0
+        except Exception:
+            ver = 0.0
+    _FFVER[key] = ver
+    return ver
+
+
 def find_ffmpeg():
-    for p in (load_config().get("ffmpeg", ""), DEFAULT_FFMPEG):
-        if p and os.path.isfile(p):
-            return p
-    return shutil.which("ffmpeg") or "ffmpeg"
+    """挑 ffmpeg：FFMPEG 环境变量 > config.json 的 ffmpeg > PATH/DEFAULT 里版本更高的。
+
+    modified: 以前是「DEFAULT_FFMPEG 存在就直接用」，于是 2018 年的老构建
+    把 PATH 里的新版全挡住了。视频号直播有时是 H.265（Enhanced-FLV，
+    video tag 的 codec id = 12），6.1 以前根本不认这种流，转封装必然失败在
+    "dimensions not set" —— 改成按版本挑，谁新用谁。
+    """
+    forced = os.environ.get("FFMPEG") or load_config().get("ffmpeg") or ""
+    if forced and os.path.isfile(forced):
+        return forced
+    cands = [p for p in (shutil.which("ffmpeg"), DEFAULT_FFMPEG)
+             if p and os.path.isfile(p)]
+    if not cands:
+        return "ffmpeg"
+    cands.sort(key=ffmpeg_version, reverse=True)
+    return cands[0]
 
 
 def has_ffmpeg():
@@ -289,7 +336,16 @@ def ffmpeg_run(args, timeout=1800):
 
 
 def ffmpeg_remux(src, dst):
-    return ffmpeg_run(["-i", src, "-c", "copy", "-movflags", "+faststart", dst])
+    ok, err = ffmpeg_run(["-i", src, "-c", "copy", "-movflags", "+faststart", dst])
+    if not ok and ("dimensions not set" in err
+                   or "is not implemented" in err and "codec" in err):
+        # modified: 这两句是「流是 H.265(Enhanced-FLV)，当前 ffmpeg 太旧」的固定症状。
+        # 光报原文没人看得懂，直接把原因和出口写清楚；FLV 原文件是好的，换新版重转即可。
+        err += ("\n（这段直播是 H.265 / Enhanced-FLV，当前 ffmpeg "
+                f"{ffmpeg_version(find_ffmpeg()):.1f} 解不了这种流。"
+                "把 FFMPEG 环境变量或 config.json 里的 ffmpeg 换成 6.1 以上版本即可，"
+                "FLV 原文件不用重录）")
+    return ok, err
 
 
 def ffmpeg_to_mp3(src, dst):
@@ -305,6 +361,52 @@ def ffmpeg_cover(src, dst, at=5):
         if os.path.isfile(dst) and os.path.getsize(dst) > 1024:
             return True
     return False
+
+
+def flv_video_codec(path, limit=1 << 20):
+    """读 FLV 开头一段，返回第一个视频 tag 的 codec id（读不到返回 None）。
+
+    结构：9 字节文件头 + 4 字节 PreviousTagSize0，之后每个 tag 是
+    1 字节类型（9=视频）+ 3 字节数据长度 + 3 字节时间戳 + 3 字节流号 + 数据；
+    数据首字节的低 4 位就是 codec id。7 = H.264，12 = H.265（Enhanced-FLV）。
+    """
+    try:
+        with open(path, "rb") as f:
+            buf = f.read(limit)
+    except Exception:
+        return None
+    if len(buf) < 13 or buf[:3] != b"FLV":
+        return None
+    i = 13
+    while i + 11 <= len(buf):
+        typ = buf[i] & 0x1F
+        size = int.from_bytes(buf[i + 1:i + 4], "big")
+        if typ == 9:
+            return buf[i + 11] & 0x0F if i + 11 < len(buf) else None
+        i += 11 + size + 4
+    return None
+
+
+def note_codec(t):
+    """记下编码并在「H.265 + 老 ffmpeg」时提前告警。
+
+    modified: 视频号直播有的是 H.265（Enhanced-FLV）。老 ffmpeg 解不了这种流，
+    转封装会在结束时才失败 —— 那会儿已经录了一两个小时。这里录到几百 KB
+    就能看出来，提前说清楚。
+    """
+    codec = flv_video_codec(t.get("flv") or "")
+    if codec is None:
+        return
+    t["codec"] = {7: "avc", 12: "hevc"}.get(codec, f"id{codec}")
+    if codec != 12:
+        return
+    ver = ffmpeg_version(find_ffmpeg())
+    if ver < 6.1:
+        add_log(f"⚠ #{t['id']} 这段直播是 H.265，当前 ffmpeg {ver:.1f} 解不了，"
+                f"录完转封装会失败；把 FFMPEG 环境变量或 config.json 里的 ffmpeg "
+                f"换成 6.1 以上版本（录制本身不受影响）")
+    else:
+        add_log(f"#{t['id']} 视频编码 H.265，ffmpeg {ver:.1f} 可正常转封装")
 
 
 def probe_alive(url, timeout=8):
@@ -1581,6 +1683,11 @@ def manager():
                     t["reconnects"] = r.reconnects
                     if getattr(r, "total", 0):
                         t["total"] = r.total
+                    # modified: 录到几百 KB 就能看出这段流是 H.264 还是 H.265。
+                    # H.265 + 老 ffmpeg 要到录完转封装才失败，那会儿已经白录几小时了。
+                    if (t["status"] == "录制中" and not t.get("codec")
+                            and (t.get("bytes") or 0) > 300000):
+                        note_codec(t)
                 if t["t0"]:
                     t["elapsed"] = time.time() - t["t0"]
 
@@ -2409,7 +2516,13 @@ def serve():
 
     try:
         add_log(f"视频号下载器 v{VERSION} 启动")
-        add_log(f"ffmpeg: {find_ffmpeg()}")
+        # modified: 把版本号一起打出来。转封装失败时第一件事就是看这里用的哪个版本。
+        _ff = find_ffmpeg()
+        _ver = ffmpeg_version(_ff)
+        _warn = ("　⚠ 版本偏旧，遇到 H.265 直播会转封装失败（建议 6.1+）"
+                 if _ver and _ver < 6.1 else "")
+        add_log(f"ffmpeg: {_ff}（v{_ver:g}）{_warn}" if _ver
+                else f"ffmpeg: {_ff}（版本未知）")
         ok_node, node_msg = wxdecrypt.available()
         add_log(f"回放解密：{'就绪' if ok_node else '不可用 — ' + node_msg}")
 

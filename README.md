@@ -254,6 +254,18 @@ req_json = {"finder_basereq":{...},
 
 ## 版本记录
 
+### v5.7.3（2026-11-02）H.265 直播与 ffmpeg 版本适配
+
+- **转封装失败的真正原因**：视频号直播可能下发 **H.265（Enhanced-FLV，video tag codec id = 12）**，
+  2023 年以前的 ffmpeg 不认这种流，解复用阶段就报 `Video codec (c) is not implemented`，
+  转封装则报 `dimensions not set / Could not write header`。FLV 本身是好的，换 6.1+ 的 ffmpeg 重转即可。
+- **ffmpeg 按版本挑**：`FFMPEG` 环境变量 > `config.json` 的 `ffmpeg` > `PATH`/内置路径里版本更高的那个。
+  以前是「内置路径存在就用」，2018 年的老构建会把 PATH 里的新版全挡住。
+- **录制中提前告警**：录到几百 KB 就解析 FLV 首个视频 tag 的 codec id，识别出 H.265 且当前 ffmpeg 低于 6.1 时，
+  立刻在日志里提示「录完会转封装失败」，不必等录完两小时才发现。
+- **失败提示可执行**：转封装报上述错误时，直接在错误里写明「H.265 / 当前 ffmpeg 版本 / 换成 6.1+ 即可，FLV 不用重录」。
+- MP3 与封面同名也走 `(2)` 避让，不再被 ffmpeg 的 `-y` 覆盖。
+
 ### v5.7.2（2026-11-02）界面重排与命名收口
 
 - 视频号页卡片顺序改为：①自动嗅探 → ②嗅探结果 → ③任务与进度 → ④日志 → 保存设置 → 手动填地址（置底）。
