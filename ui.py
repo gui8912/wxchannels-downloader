@@ -28,6 +28,9 @@ select{font-family:"Microsoft YaHei UI",sans-serif;padding:7px 9px}
 textarea{height:68px;resize:vertical;word-break:break-all}
 textarea:focus,input[type=text]:focus,select:focus{border-color:#1f6feb;box-shadow:0 0 0 3px rgba(31,111,235,.15)}
 input[type=number]:focus{border-color:#484f58;box-shadow:none}
+/* 行内小数字框：高度压到跟同行文字齐平，宽度只够 3 位数，别再撑成一个大方块 */
+input[type=number].num-mini{width:58px;height:27px;padding:0 2px 0 6px;
+  line-height:25px;text-align:center;vertical-align:middle}
 .hint{font-size:12px;color:#8b949e;margin-top:7px}
 .hint.warn{color:#d29922}.hint.bad{color:#f85149}.hint.ok{color:#3fb950}
 .row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
@@ -215,16 +218,15 @@ textarea.slim{height:52px}
       <input type="number" id="limit" value="0" min="0" step="5"></div>
     <div style="flex:0 0 auto"><button onclick="openDir()">打开目录</button></div>
   </div>
-  <div class="row" style="margin-top:10px;gap:18px">
+  <div class="row" style="margin-top:10px;gap:18px;align-items:center">
     <label style="margin:0;display:flex;align-items:center;gap:5px;cursor:pointer">
       <input type="checkbox" id="audio"> 同时导出 MP3</label>
     <label style="margin:0;display:flex;align-items:center;gap:5px"
            title="静音超过这么多分钟就自动停止。0 = 不启用。以前写死 5 分钟，容易在安静的直播里误停">
-      静音
-      <input type="number" id="silence" value="0" min="0" max="720" step="1"
-             style="width:70px;padding:8px 4px 8px 6px;text-align:center"> 分钟自动停</label>
+      静音<input type="number" id="silence" value="0" min="0" max="720" step="1"
+             class="num-mini">分钟自动停</label>
     <label style="margin:0;display:flex;align-items:center;gap:5px;cursor:pointer">
-      <input type="checkbox" id="waitlive"> 未开播就蹲守（20 秒探测）</label>
+      <input type="checkbox" id="waitlive"> 未开播就蹲守（60 秒探测）</label>
     <label style="margin:0;display:flex;align-items:center;gap:5px;cursor:pointer"
            title="默认不加日期。勾上后在名称末尾追加当天日期，如「课程名2026-10-29」">
       <input type="checkbox" id="datetag"> 文件名加日期</label>

@@ -34,7 +34,7 @@ import sniffer as sniff_mod
 import ui as ui_mod
 import wxdecrypt
 
-VERSION = "5.7.5"
+VERSION = "5.7.6"
 BUILD = "2026-11-02"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -86,7 +86,7 @@ def _ui_port():
 
 
 PORT = _ui_port()
-PROBE_INTERVAL = 20          # 蹲守模式探测间隔（秒）
+PROBE_INTERVAL = 60          # 蹲守模式探测间隔（秒）
 SILENCE_DEFAULT_MIN = 5      # modified: 静音自动停的默认分钟数（旧记录/旧前端只给布尔值时用它）
 SNIFF_MAX_SECONDS = 1800     # 嗅探最长挂 30 分钟，之后自动停并还原代理
 STALL_SECONDS = 120          # 直播多久没有新数据算卡死
@@ -1645,7 +1645,7 @@ def _do_finish_async(t):
 def _rotate_queue(tid):
     """把队首挪到队尾。
 
-    蹲守任务每 20 秒才探一次，如果它一直占着队首，后面排队的任务就永远
+    蹲守任务每 60 秒才探一次，如果它一直占着队首，后面排队的任务就永远
     轮不到 —— 加一个还没开播的蹲守，整个队列直接停摆。所以每次探完
     （或还没到探测时间）就让它排到队尾，给别人让路。
     """
