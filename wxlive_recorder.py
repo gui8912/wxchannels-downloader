@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-视频号直播 / 回放下载器  v5.6.0
+视频号直播 / 回放下载器  v5.7.1
 ============================================================================
 · 直播：FLV 边拉边写，断流自动重连，录完转封装 MP4
 · 回放：HTTP Range 下载（可续传）→ 官方 WASM 解密 → MP4 / MP3 / 封面
@@ -11,6 +11,7 @@
 ============================================================================
 """
 import atexit
+import importlib
 import json
 import math
 import os
@@ -28,12 +29,13 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import bridge_server
+import hlsdl
 import sniffer as sniff_mod
 import ui as ui_mod
 import wxdecrypt
 
-VERSION = "5.6.0"
-BUILD = "2026-11-01"
+VERSION = "5.7.1"
+BUILD = "2026-11-02"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
@@ -45,7 +47,45 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 CREATE_NO_WINDOW = 0x08000000
 FLV_HEADER_LEN = 13          # 9 字节文件头 + 4 字节 PreviousTagSize
-PORT = 8765
+# modified: 5.7.1 端口从 8765 改为 8766。
+# 8765 是澄文扫描台（服务台里 docscan）的固定端口，两个都写死 8765 时谁先起谁占着，
+# 后启动的那个直接静默退出 —— pythonw 没有控制台，用户只看到"点了没反应"。
+# 服务台里两个卡片还会互相误认（端口一响就当成自己在跑），停一个会杀掉另一个。
+DEFAULT_PORT = 8766
+
+# modified: 页面模板热加载 —— 改完 ui.py 刷新浏览器就能看到，不必重启服务。
+# 重启会中断正在进行的录制（录制线程活在本进程里），而调界面往往是在录制过程中进行的。
+# 只重载 ui 这个纯字符串模块；模板写坏时继续用旧版本，不会把页面搞成白屏。
+_UI_CACHE = {"mtime": 0.0}
+
+
+def ui_html():
+    try:
+        mt = os.path.getmtime(ui_mod.__file__)
+    except Exception:
+        mt = 0.0
+    if mt and mt != _UI_CACHE["mtime"]:
+        _UI_CACHE["mtime"] = mt
+        try:
+            importlib.reload(ui_mod)
+        except Exception as e:
+            try:
+                add_log(f"⚠ 页面模板有错，继续用旧版：{e}")
+            except Exception:
+                pass
+    return ui_mod.HTML
+
+
+def _ui_port():
+    """modified: UI 端口可用环境变量 WX_UI_PORT 临时覆盖（自测用），非法值一律回退默认。"""
+    try:
+        port = int(os.environ.get("WX_UI_PORT") or DEFAULT_PORT)
+    except (TypeError, ValueError):
+        return DEFAULT_PORT
+    return port if 1 <= port <= 65535 else DEFAULT_PORT
+
+
+PORT = _ui_port()
 PROBE_INTERVAL = 20          # 蹲守模式探测间隔（秒）
 SILENCE_SECONDS = 300        # 静音多久算"没人了"
 SNIFF_MAX_SECONDS = 1800     # 嗅探最长挂 30 分钟，之后自动停并还原代理
@@ -321,13 +361,16 @@ class Recorder(threading.Thread):
         self.t0 = time.time()
         self.last_data = time.time()
         self.logs = __import__("queue").Queue()
-        self._stop = threading.Event()
+        # modified: 千万别叫 self._stop —— Thread 内部自带同名方法 _stop()，
+        # 被 Event 覆盖后，is_alive()/join() 会抛 "'Event' object is not
+        # callable"，调度线程每轮都炸、任务永远收不了尾（实测踩过）。
+        self._stop_evt = threading.Event()
 
     def log(self, msg):
         self.logs.put(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
 
     def run(self):
         first = not self.append
@@ -341,7 +384,7 @@ class Recorder(threading.Thread):
             self.log(f"接着已有文件往后录（{fmt_size(self.bytes)}）")
 
         try:
-            while not self._stop.is_set():
+            while not self._stop_evt.is_set():
                 got = 0
                 resp = None
                 try:
@@ -352,7 +395,7 @@ class Recorder(threading.Thread):
                     self.state = "录制中"
 
                     head = b""
-                    while len(head) < FLV_HEADER_LEN and not self._stop.is_set():
+                    while len(head) < FLV_HEADER_LEN and not self._stop_evt.is_set():
                         more = resp.read(FLV_HEADER_LEN - len(head))
                         if not more:
                             break
@@ -372,7 +415,7 @@ class Recorder(threading.Thread):
                     # 重连时这一段直接丢弃（服务端每次都重发文件头）
 
                     last_flush = time.time()
-                    while not self._stop.is_set():
+                    while not self._stop_evt.is_set():
                         chunk = resp.read(65536)
                         if not chunk:
                             self.log("服务端关闭了连接")
@@ -393,7 +436,7 @@ class Recorder(threading.Thread):
                 except ValueError:
                     got = 0
                 except Exception as e:
-                    if self._stop.is_set():
+                    if self._stop_evt.is_set():
                         break
                     self.error = str(e)
                     self.log(f"断开：{e}")
@@ -408,7 +451,7 @@ class Recorder(threading.Thread):
                         except Exception:
                             pass
 
-                if self._stop.is_set():
+                if self._stop_evt.is_set():
                     break
 
                 # 连着几次都一个字节没拿到 → 直播源已经停了
@@ -425,7 +468,7 @@ class Recorder(threading.Thread):
                 self.reconnects += 1
                 self.state = "重连中"
                 self.log(f"第 {self.reconnects} 次重连…")
-                self._stop.wait(2)
+                self._stop_evt.wait(2)
         except Exception as e:
             self.error = str(e)[:200]
             self.state = "失败"
@@ -466,7 +509,8 @@ class Downloader(threading.Thread):
         self.logs = __import__("queue").Queue()
         self.last_data = time.time()
         self.reconnects = 0
-        self._stop = threading.Event()
+        # modified: 同上，不能覆盖 Thread._stop()，否则 is_alive() 直接抛异常
+        self._stop_evt = threading.Event()
         # modified: 416 只重置一次，避免远端异常时无限“清零再请求”
         self._resume_reset_used = False
 
@@ -474,18 +518,18 @@ class Downloader(threading.Thread):
         self.logs.put(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
 
     def run(self):
         # modified: 重试按“连续无进展”计数，成功续传不会消耗重试次数
         no_progress = 0
         total_attempts = 0
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             total_attempts += 1
             before = os.path.getsize(self.part) if os.path.isfile(self.part) else 0
             try:
                 self._fetch_once()
-                if self._stop.is_set():
+                if self._stop_evt.is_set():
                     self.state = "已停止"
                     return
                 if self.total and self.bytes < self.total:
@@ -494,7 +538,7 @@ class Downloader(threading.Thread):
                 self.state = "下载完成"
                 return
             except Exception as e:
-                if self._stop.is_set():
+                if self._stop_evt.is_set():
                     self.state = "已停止"
                     return
                 after = os.path.getsize(self.part) if os.path.isfile(self.part) else 0
@@ -508,7 +552,7 @@ class Downloader(threading.Thread):
                 self.reconnects += 1
                 self.log(f"下载中断：{e}，2 秒后重试"
                          f"（共 {total_attempts} 次，连续无进展 {no_progress} 次）")
-                self._stop.wait(2)
+                self._stop_evt.wait(2)
                 if no_progress >= 8:
                     self.state = "失败"
                     self.error = f"连续 {no_progress} 次没有进展：{self.error}"
@@ -580,7 +624,7 @@ class Downloader(threading.Thread):
 
             mode = "ab" if start else "wb"
             with open(self.part, mode) as f:
-                while not self._stop.is_set():
+                while not self._stop_evt.is_set():
                     chunk = resp.read(262144)
                     if not chunk:
                         break
@@ -592,7 +636,7 @@ class Downloader(threading.Thread):
                 resp.close()
             except Exception:
                 pass
-        if self._stop.is_set():
+        if self._stop_evt.is_set():
             self.state = "已停止"
 
 
@@ -1464,6 +1508,47 @@ def _rotate_queue(tid):
         q.append(q.pop(0))
 
 
+_MGR_ERR_AT = 0.0        # modified: 调度异常日志的限流时间戳（同一故障 30 秒只记一次）
+
+
+def _mgr_log_error(e):
+    """调度循环异常：记一行原因 + 调用位置，30 秒内同故障不重复刷屏。"""
+    global _MGR_ERR_AT
+    now = time.time()
+    if now - _MGR_ERR_AT < 30:
+        return
+    _MGR_ERR_AT = now
+    add_log(f"调度异常：{e}")
+    tb = [x.strip() for x in traceback.format_exc().strip().splitlines()]
+    add_log("调度位置：" + " | ".join(tb[-4:])[:400])
+
+
+def _finish_dead_active():
+    """线程已退出但状态还挂在「录制中/下载中」→ 推进到收尾，且只做一次。
+
+    # modified: 从 manager 循环体里抽出来，放在 finally 中兜底调用。
+    # 原先这一步写在循环体末尾，前面任何一句抛异常都会跳过它，
+    # 任务就永远停在「录制中」，队列也跟着停摆。
+    """
+    aid = STATE["active"]
+    if not aid:
+        return
+    t = task_by_id(aid)
+    if not t:
+        with LOCK:
+            STATE["active"] = None
+        return
+    r = t.get("rec")
+    if (t.get("status") in RUNNING_STATES and r and not r.is_alive()
+            and not t.get("finishing")):
+        t["finishing"] = True
+        t["status"] = "收尾中"
+        add_log(f"#{aid} " + ("下载结束" if t.get("kind") == "replay"
+                              else "录制结束")
+                + f"（{getattr(r, 'state', '已停止')}）")
+        threading.Thread(target=_do_finish_async, args=(t,), daemon=True).start()
+
+
 def manager():
     """总调度：跑队列 + 盯当前任务 + 蹲守探测"""
     while True:
@@ -1508,15 +1593,9 @@ def manager():
                         add_log(f"超过 {DL_STALL_SECONDS // 60} 分钟没有新数据，停止 #{aid}")
                         stop_task(aid, "下载无进展")
 
-                # 线程结束（自然结束 / 被判结束 / 手动停）→ 收尾，且只收一次
-                if (t["status"] in RUNNING_STATES and r
-                        and not r.is_alive() and not t["finishing"]):
-                    t["finishing"] = True
-                    t["status"] = "收尾中"
-                    add_log(f"#{aid} " + ("下载结束" if t.get("kind") == "replay"
-                                          else "录制结束") + f"（{r.state}）")
-                    threading.Thread(target=_do_finish_async, args=(t,),
-                                     daemon=True).start()
+                # modified: 收尾判断挪到 finally 里的 _finish_dead_active()。
+                # 这样上面任何一步抛异常，已死的任务仍然会被推进到收尾，
+                # 不会卡在「录制中」把整个队列拖停。
                 continue
 
             # 空闲：挑下一个
@@ -1573,7 +1652,17 @@ def manager():
                 add_log(f"✘ #{tid} 启动失败：{e}")
             save_tasks()
         except Exception as e:
-            add_log(f"调度异常：{e}")
+            # modified: 只打异常文本无法定位（例如 "'Event' object is not callable"
+            # 不知道出在哪一行），这里补一行调用栈；并做 30 秒限流，
+            # 否则 0.5 秒一轮会把日志刷成几百条同样的内容。
+            _mgr_log_error(e)
+        finally:
+            # modified: 兜底收尾。循环体中途报错时，线程已退出的任务原本永远
+            # 进不了「收尾中」——界面卡在「录制中」、后面的队列也不再启动。
+            try:
+                _finish_dead_active()
+            except Exception:
+                pass
 
 
 # ----------------------------------------------------------------- 嗅探联动
@@ -1622,6 +1711,12 @@ def sniff_watch():
                 started = None
                 continue
             hits = SNIFFER.poll()
+            # modified: 过期地址单独提示一行。预约直播、页面缓存都会带出早已
+            # 失效的签名，用户看着"抓到了"却录出 0 字节，必须当场说清楚。
+            bad = [h for h in hits if h.get("expired")]
+            if bad:
+                add_log(f"⚠ 忽略 {len(bad)} 条已过期地址（{bad[0].get('expiry') or '签名已过期'}）"
+                        f"，多为预约直播或页面缓存；请刷新直播页重新抓一条")
             # 真正在播的那条要等播放器上报播放位置才认得出来，所以日志走事件流，
             # 不能只看 poll() 这一批（它返回时 played 可能还没打上）
             for h in SNIFFER.take_played_events():
@@ -1657,6 +1752,15 @@ def _allowed_roots():
     cfg_dir = load_config().get("last_dir")
     if cfg_dir:
         roots.add(os.path.normcase(os.path.abspath(cfg_dir)))
+    # modified: m3u8 可以存到任意目录，这些目录也要能「打开/播放」，否则下完点不开
+    for d in hlsdl.output_dirs():
+        try:
+            roots.add(os.path.normcase(os.path.abspath(d)))
+        except Exception:
+            pass
+    hls_dir = load_config().get("hls_dir")
+    if hls_dir:
+        roots.add(os.path.normcase(os.path.abspath(hls_dir)))
     return roots
 
 
@@ -1813,7 +1917,7 @@ class Handler(BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(self.path.split("?")[1] if "?" in self.path else "")
         try:
             if path in ("/", "/index.html"):
-                self._send(200, ui_mod.HTML, "text/html; charset=utf-8")
+                self._send(200, ui_html(), "text/html; charset=utf-8")
             elif path == "/api/status":
                 since = 0
                 try:
@@ -1934,10 +2038,14 @@ class Handler(BaseHTTPRequestHandler):
             return dedup_tasks(apply=bool(body.get("apply", True)))
 
         if p == "/api/task/queue":
-            n = reused = 0
+            n = reused = skipped = 0
             for hid in (body.get("ids") or []):
                 h = SNIFFER.hit_by_id(hid)
                 if not h:
+                    continue
+                # modified: 过期地址不入队，单独计数并在提示里说明
+                if h.get("expired"):
+                    skipped += 1
                     continue
                 before = len(STATE["tasks"])
                 t = new_task(h.get("name", ""), h["url"], opts["dir"],
@@ -1955,12 +2063,20 @@ class Handler(BaseHTTPRequestHandler):
             msg = f"新建 {n} 条任务" if n else "没有新建任务"
             if reused:
                 msg += f"，{reused} 条已在队列里（跳过了）"
+            if skipped:
+                msg += f"，{skipped} 条地址已过期（请刷新直播页重新抓）"
             return {"ok": True, "n": n, "msg": msg}
 
         if p == "/api/hit/record":
             h = SNIFFER.hit_by_id(body.get("id"))
             if not h:
                 return {"ok": False, "msg": "结果不存在（可能已被清理）"}
+            # modified: 过期签名一律拦住。预约直播、页面缓存都会翻出旧地址，
+            # 拿去录只会 403 + 0 字节，不如当场说清楚。
+            if h.get("expired"):
+                return {"ok": False,
+                        "msg": f"这条地址已于 {h.get('expiry') or '之前'} 过期"
+                               f"（多为预约直播或页面缓存），请刷新直播页重新抓一条"}
             t = new_task(h.get("name", ""), h["url"], opts["dir"], opts["limit"],
                          opts["audio"], opts["silence"], opts["wait_live"],
                          h.get("kind", "live"), h.get("decode_key", ""),
@@ -2012,6 +2128,45 @@ class Handler(BaseHTTPRequestHandler):
                          "ffmpeg": body.get("ffmpeg") or find_ffmpeg()})
             return {"ok": True, "msg": "已保存"}
 
+        # ------------------------------------------------ HLS / m3u8 下载
+        if p == "/api/hls/probe":
+            return hlsdl.probe(body.get("url") or "",
+                               body.get("referer") or "",
+                               body.get("ua") or "",
+                               hlsdl.parse_headers(body.get("extra_headers")))
+
+        if p == "/api/hls/start":
+            res = hlsdl.add(dict(body, ffmpeg=find_ffmpeg()))
+            if res.get("ok"):
+                save_config({"hls_dir": body.get("dir") or "",
+                             "hls_referer": body.get("referer") or "",
+                             "hls_ua": body.get("ua") or "",
+                             "hls_opts": {k: body.get(k) for k in
+                                          ("threads", "retry", "timeout", "fmt",
+                                           "auto_select", "concurrent", "del_after_done",
+                                           "skip_merge", "max_speed", "use_system_proxy",
+                                           "extra") if body.get(k) is not None}})
+            return res
+
+        if p == "/api/hls/stop":
+            return hlsdl.stop(body.get("id"))
+
+        if p == "/api/hls/del":
+            return hlsdl.remove(body.get("id"))
+
+        if p == "/api/hls/clear":
+            return hlsdl.clear()
+
+        if p == "/api/hls/re":
+            info = hlsdl.set_exe(body.get("path") or "")
+            if info.get("ok"):
+                save_config({"re_exe": info["path"]})
+                add_log(f"m3u8 下载器：{info['path']}（v{info['version']}）")
+            return info
+
+        if p == "/api/pickdir":
+            return hlsdl.pick_dir(body.get("initial") or opts["dir"] or DEFAULT_OUTDIR)
+
         return {"ok": False, "msg": "未知接口"}
 
 
@@ -2027,6 +2182,11 @@ def api_health():
     mitm = sniff_mod.find_mitmdump()
     items.append({"name": "mitmdump（嗅探）", "ok": bool(mitm), "detail": mitm or "未找到",
                   "hint": "没有它就嗅探不到地址，只能手动粘链接"})
+    re_info = hlsdl.exe_info()
+    items.append({"name": "N_m3u8DL-RE（m3u8 下载）", "ok": re_info["ok"],
+                  "detail": (f"{re_info['path']}  v{re_info['version']}")
+                            if re_info["ok"] else "未找到",
+                  "hint": "m3u8 标签页靠它下载；下载后把完整路径填到「程序路径」并点检测"})
     outdir = load_config().get("last_dir") or DEFAULT_OUTDIR
     free = disk_free(outdir if os.path.isdir(outdir) else APP_DIR)
     items.append({"name": "磁盘空间", "ok": free < 0 or free > 1024 ** 3,
@@ -2052,11 +2212,14 @@ def api_status(since):
         logs = [x for i, x in STATE["logs"] if i >= since]
         nxt = STATE["log_seq"]
     sn = SNIFFER.status()
+    hls = hlsdl.status()
     warnings = []
     if not has_ffmpeg():
         warnings.append("找不到 ffmpeg：转封装、MP3、封面都用不了")
     if not wxdecrypt.available()[0]:
         warnings.append("回放解密不可用（缺 node.exe）")
+    if not hls.get("exe"):
+        warnings.append("没找到 N_m3u8DL-RE.exe：m3u8 下载标签页用不了")
     if sn.get("state") == "已中断":
         warnings.append("嗅探进程已退出，系统代理已自动还原")
     return {
@@ -2066,6 +2229,7 @@ def api_status(since):
         "dir": load_config().get("last_dir") or DEFAULT_OUTDIR,
         "default_dir": DEFAULT_OUTDIR,
         "sniff": sn, "logs": logs, "next": nxt,
+        "hls": hls,
         "warnings": warnings,
         "uptime": int(now - STATE["started_at"]),
         "restart_count": STATE["restart_count"],
@@ -2082,6 +2246,11 @@ def _shutdown():
         SNIFFER.stop(restore=True)
     except Exception:
         pass
+    # modified: os._exit 不跑 atexit，m3u8 的子进程必须在这里手动收掉
+    try:
+        hlsdl.shutdown()
+    except Exception:
+        pass
     time.sleep(0.3)
     os._exit(0)
 
@@ -2095,6 +2264,10 @@ def api_restart():
     save_tasks()
     try:
         SNIFFER.stop(restore=True)
+    except Exception:
+        pass
+    try:
+        hlsdl.shutdown()
     except Exception:
         pass
     STATE["restart_count"] += 1
@@ -2120,6 +2293,50 @@ def api_restart():
 
 
 # ----------------------------------------------------------------- 启动
+def _port_owner(port):
+    """modified: 5.7.1 查是哪个进程占着端口，只为了把报错说清楚。
+
+    本工具依赖只有标准库，不引 psutil：netstat 给出 PID，tasklist 给进程名。
+    任何一步失败都返回 None，绝不让"查占用"本身把启动流程搞崩。
+    """
+    def _run(cmd):
+        """modified: netstat/tasklist 写的是控制台代码页（中文系统 GBK），
+        不是 UTF-8。text=True 在 UTF-8 模式下会直接抛 UnicodeDecodeError，
+        结果"查占用"永远返回 None。所以按字节读，再按 mbcs 宽松解码。"""
+        raw = subprocess.run(cmd, capture_output=True, timeout=5,
+                             creationflags=CREATE_NO_WINDOW).stdout
+        try:
+            return raw.decode("mbcs", "replace")
+        except LookupError:
+            return raw.decode("utf-8", "replace")
+
+    pid = None
+    try:
+        out = _run(["netstat", "-ano", "-p", "tcp"])
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[3].upper() == "LISTENING":
+                if parts[1].rsplit(":", 1)[-1] == str(port):
+                    try:
+                        pid = int(parts[4])
+                    except ValueError:
+                        pid = None
+                    if pid:
+                        break
+    except Exception:
+        return None
+    if not pid:
+        return None
+    name = ""
+    try:
+        out = _run(["tasklist", "/FI", "PID eq %d" % pid, "/FO", "CSV", "/NH"]).strip()
+        first = out.splitlines()[0] if out else ""
+        name = first.split('","')[0].strip('" ').strip()
+    except Exception:
+        pass
+    return pid, (name or "未知程序")
+
+
 def serve():
     from_restart = "--from-restart" in sys.argv
     no_browser = "--no-browser" in sys.argv
@@ -2140,7 +2357,7 @@ def serve():
                 webbrowser.open(url)
             return
 
-    # modified: 先占住固定端口再初始化；不再自动换到 8766 起第二个实例
+    # modified: 先占住固定端口再初始化；不再自动换端口起第二个实例
     httpd = None
     last_error = ""
     attempts = 160 if from_restart else 1
@@ -2154,8 +2371,18 @@ def serve():
                 break
             time.sleep(0.25)
     if httpd is None:
-        print(f"无法监听 127.0.0.1:{port}：{last_error or '端口被占用'}。"
-              "请关闭占用该端口的程序后重试。")
+        # modified: 5.7.1 端口被别人占时，把占用进程也打出来。
+        # pythonw 没有控制台，这行 print 会进服务台的启动日志，用户能看到到底谁占了。
+        owner = _port_owner(port)
+        who = f"，被 {owner[1]}（PID {owner[0]}）占用" if owner else ""
+        reason = (last_error or '端口被占用').rstrip('。.')   # modified: 别出现"一次。，被"
+        msg = (f"无法监听 127.0.0.1:{port}：{reason}{who}。"
+               f"请关闭占用该端口的程序，或用环境变量 WX_UI_PORT 换一个端口。")
+        print(msg)
+        try:
+            add_log("⚠ " + msg)
+        except Exception:
+            pass
         return
 
     try:
@@ -2190,9 +2417,13 @@ def serve():
         except Exception:
             pass
 
+        # m3u8 下载器：找到就报个版本，找不到只记一条警告，不影响主功能
+        hlsdl.init(load_config().get("re_exe") or "")
+
         threading.Thread(target=manager, daemon=True).start()
         threading.Thread(target=sniff_watch, daemon=True).start()
-        atexit.register(lambda: (save_tasks(), SNIFFER.stop(restore=True)))
+        atexit.register(lambda: (save_tasks(), SNIFFER.stop(restore=True),
+                                 hlsdl.shutdown()))
     except Exception:
         try:
             httpd.server_close()
@@ -2213,6 +2444,10 @@ def serve():
         save_tasks()
         try:
             SNIFFER.stop(restore=True)
+        except Exception:
+            pass
+        try:
+            hlsdl.shutdown()
         except Exception:
             pass
 

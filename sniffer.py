@@ -107,8 +107,9 @@ def sanitize_override(ovr):
 
     两个坑：
       · `<-loopback>` 会让**本地环回也走代理**（别的抓包工具爱加它）。一旦带上，
-        本工具自己的 8765 轮询、以及用户本机跑的所有服务都会被拖进代理，
-        mitm.log 里能看到每 0.8 秒一条 `server connect 127.0.0.1:8765`。
+        本工具自己的 UI 轮询（v5.7.1 起是 8766，旧版 8765）、以及用户本机跑的
+        所有服务都会被拖进代理，mitm.log 里能看到每 0.8 秒一条
+        `server connect 127.0.0.1:8766`。
       · 用户原有条目要保留，不要替人家决定绕过哪些站点。
     """
     parts = []
@@ -304,7 +305,7 @@ class Sniffer:
             if url in self._seen:
                 return None
             self._seen.add(url)
-            exp = ""
+            exp, expired = "", False
             # t 可能是 unix 时间戳（float），也可能已经是 "HH:MM:SS" 字符串
             # （reparse 从盘上读回来的就是字符串）。直接丢给 localtime 会抛
             # TypeError，把整个 poll 打断。
@@ -317,7 +318,12 @@ class Sniffer:
             try:
                 m = re.search(r"[?&]txTime=([0-9a-fA-F]+)", url)
                 if m:
-                    exp = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(m.group(1), 16)))
+                    ts = int(m.group(1), 16)
+                    exp = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+                    # modified: 预约直播 / 页面缓存里翻出来的旧签名，txTime 早已
+                    # 过期，服务器一律 403。标成"已过期"，不参与自动抓取和入队，
+                    # 否则用户会以为抓到了、录了半天却只有 0 字节。
+                    expired = ts < time.time()
             except Exception:
                 pass
             kind = meta.get("kind") or "live"
@@ -350,7 +356,8 @@ class Sniffer:
                         h["filesize"] = fsize
                     return None
             hit = {"id": self._next_id, "url": url, "t": when, "kind": kind,
-                   "expiry": exp, "name": "", "status": "待录制",
+                   "expiry": exp, "expired": expired,
+                   "name": "", "status": "已过期" if expired else "待录制",
                    "decode_key": str(meta.get("decode_key") or ""),
                    "author": meta.get("author") or "",
                    "objectid": str(meta.get("objectid") or ""),
@@ -361,7 +368,9 @@ class Sniffer:
                    }
             # 直播流是代理从 FLV 请求里直接抓的，房间里就这一路流，不存在
             # "侧栏推荐"这回事 —— 直接算作"在播"，否则会被自动过滤误伤。
-            hit["played"] = (kind == "live") or self._is_played(url, hit["objectid"])
+            # modified: 但过期地址不能算"在播"，否则会被自动抓去入队。
+            hit["played"] = (not expired) and (
+                (kind == "live") or self._is_played(url, hit["objectid"]))
             w, h = meta.get("width") or 0, meta.get("height") or 0
             if w and h:
                 hit["resolution"] = "%dx%d" % (int(w), int(h))

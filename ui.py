@@ -21,10 +21,11 @@ h1{font-size:19px;margin:0;font-weight:600;display:flex;align-items:center;gap:9
 .card{background:#161b22;border:1px solid #21262d;border-radius:10px;padding:15px 17px;margin-bottom:13px}
 .card.alert{border-color:#9e6a03;background:#1e1a0d}
 label{display:block;font-size:12.5px;color:#8b949e;margin-bottom:6px}
-textarea,input[type=text],input[type=number]{width:100%;background:#0d1117;color:#e6edf3;
+textarea,input[type=text],input[type=number],select{width:100%;background:#0d1117;color:#e6edf3;
   border:1px solid #30363d;border-radius:6px;padding:8px 11px;font:12.5px/1.5 Consolas,monospace;outline:none}
+select{font-family:"Microsoft YaHei UI",sans-serif;padding:7px 9px}
 textarea{height:68px;resize:vertical;word-break:break-all}
-textarea:focus,input:focus{border-color:#1f6feb;box-shadow:0 0 0 3px rgba(31,111,235,.15)}
+textarea:focus,input:focus,select:focus{border-color:#1f6feb;box-shadow:0 0 0 3px rgba(31,111,235,.15)}
 .hint{font-size:12px;color:#8b949e;margin-top:7px}
 .hint.warn{color:#d29922}.hint.bad{color:#f85149}.hint.ok{color:#3fb950}
 .row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
@@ -74,9 +75,9 @@ table input[type=text]{background:#0d1117;border:1px solid #30363d;border-radius
 .note.bad{color:#f85149}.note.warn{color:#d29922}
 .bar{height:4px;background:#21262d;border-radius:2px;margin-top:4px;overflow:hidden}
 .bar>i{display:block;height:100%;background:#1f6feb;transition:width .4s}
-#log{height:200px;overflow:auto;background:#010409;border:1px solid #21262d;border-radius:8px;
+#log,#h-log{height:200px;overflow:auto;background:#010409;border:1px solid #21262d;border-radius:8px;
   padding:10px 12px;font:12px/1.65 Consolas,monospace;color:#8b949e;white-space:pre-wrap;word-break:break-all}
-#log .ok{color:#3fb950}#log .bad{color:#f85149}#log .warn{color:#d29922}#log .blue{color:#58a6ff}
+#log .ok,#h-log .ok{color:#3fb950}#log .bad,#h-log .bad{color:#f85149}#log .warn,#h-log .warn{color:#d29922}#log .blue,#h-log .blue{color:#58a6ff}
 .foot{color:#484f58;font-size:11.5px;text-align:center;margin-top:16px}
 .mono{font-family:Consolas,monospace}
 .sp{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
@@ -101,19 +102,35 @@ table input[type=text]{background:#0d1117;border:1px solid #30363d;border-radius
   font-size:11.5px;word-break:break-all}
 .dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;margin-top:6px}
 .dot.g{background:#3fb950}.dot.r{background:#f85149}
+/* 顶部标签页：视频号 / m3u8 两条产线分开，互不干扰 */
+.tabs{display:flex;gap:4px;margin:16px 0 14px;border-bottom:1px solid #21262d}
+.tabs button{background:transparent;border:none;border-bottom:2px solid transparent;
+  border-radius:0;padding:9px 15px;color:#8b949e;font-size:13.5px;font-weight:500}
+.tabs button:hover:not(:disabled){background:transparent;color:#c9d1d9;border-bottom-color:#30363d}
+.tabs button.on{color:#e6edf3;border-bottom-color:#f78166;font-weight:600}
+.tabs .grow{flex:1}
+textarea.slim{height:52px}
 </style></head><body><div class="wrap">
 
-<h1>视频号直播 / 回放下载器 <span id="pill">空闲</span>
+<h1>视频号 / m3u8 下载器 <span id="pill">空闲</span>
   <span class="ver" id="ver">v—</span>
   <span style="flex:1"></span>
   <button class="mini ghost" onclick="showHealth()">🩺 体检</button>
   <button class="mini ghost" onclick="restartSvc()">🔄 重启服务</button>
 </h1>
-<div class="sub">嗅探地址 → 勾选入队 → 直播边录边存、回放下载后自动解密 → MP4</div>
+<div class="sub" id="sub">嗅探地址 → 勾选入队 → 直播边录边存、回放下载后自动解密 → MP4</div>
+
+<div class="tabs">
+  <button class="on" data-tab="sph" onclick="switchTab('sph')">🎬 视频号 直播 / 回放</button>
+  <button data-tab="hls" onclick="switchTab('hls')">⬇ m3u8 / HLS 下载</button>
+  <span class="grow"></span>
+</div>
 
 <div class="card alert" id="warn-card" style="display:none">
   <div id="warn-list" class="hint bad" style="margin:0"></div>
 </div>
+
+<div id="pane-sph">
 
 <!-- ① 嗅探 -->
 <div class="card">
@@ -164,15 +181,32 @@ table input[type=text]{background:#0d1117;border:1px solid #30363d;border-radius
   <div class="hint" id="hits-empty" style="display:none"></div>
 </div>
 
-<!-- ③ 手动地址 -->
+<!-- ③ 任务 -->
 <div class="card">
-  <label>③ 手动填地址（不走嗅探时用）</label>
-  <textarea id="url" placeholder="直播流：https://pull-m1.wxlivecdn.com/trtc_xxx/orig_xxx_orig.flv?...&#10;回放：https://finder.video.qq.com/251/20302/stodownload?...（加密的会自动解密）"></textarea>
-  <div class="hint" id="exp">链接有效期：—</div>
+  <div class="row" style="align-items:center;margin-bottom:4px">
+    <label style="margin:0;flex:1">③ 任务与进度 <span class="tag" id="qinfo"></span></label>
+    <div class="sp">
+      <button class="mini" onclick="pauseAll()" title="停下所有录制和下载，文件保留，随时可以恢复">⏸ 全部暂停</button>
+      <button class="mini" onclick="resumeAll()" title="把暂停的任务重新排进队列">▶ 全部恢复</button>
+      <button class="mini" onclick="dedupTasks()">🧹 清理重复项</button>
+      <button class="mini" onclick="clearDone()">清理已结束</button>
+    </div>
+  </div>
+  <table>
+    <thead><tr><th style="width:40px">队列</th><th style="width:78px">状态</th><th>名称</th>
+      <th style="width:66px">时长</th><th style="width:150px">大小 / 进度</th>
+      <th style="width:190px">操作</th></tr></thead>
+    <tbody id="tasks"></tbody>
+  </table>
+  <div class="hint" id="empty-tasks">还没有任务。</div>
 </div>
 
-<!-- ④ 保存设置 -->
+<!-- ④ 日志 -->
+<div class="card"><label>④ 日志</label><div id="log"></div></div>
+
+<!-- 保存设置 -->
 <div class="card">
+  <label>保存设置</label>
   <div class="row">
     <div><label>保存目录</label><input type="text" id="dir" onchange="saveDir()"></div>
     <div style="flex:0 0 200px;min-width:150px"><label>课程名称（决定文件名）</label>
@@ -193,30 +227,109 @@ table input[type=text]{background:#0d1117;border:1px solid #30363d;border-radius
            title="默认不加日期。勾上后在名称末尾追加当天日期，如「课程名2026-10-29」">
       <input type="checkbox" id="datetag"> 文件名加日期</label>
   </div>
+</div>
+
+<!-- 手动地址 -->
+<div class="card">
+  <label>手动填地址（不走嗅探时用）</label>
+  <textarea id="url" placeholder="直播流：https://pull-m1.wxlivecdn.com/trtc_xxx/orig_xxx_orig.flv?...&#10;回放：https://finder.video.qq.com/251/20302/stodownload?...（加密的会自动解密）"></textarea>
+  <div class="hint" id="exp">链接有效期：—</div>
   <button class="primary" style="margin-top:12px" onclick="startManual()">▶ 加入队列并开始</button>
+</div>
+</div><!-- /pane-sph -->
+
+<!-- ==================== m3u8 / HLS 下载 ==================== -->
+<div id="pane-hls" style="display:none">
+
+<!-- ① 地址 -->
+<div class="card">
+  <label>① 粘贴 m3u8 地址</label>
+  <textarea id="h-url" placeholder="https://.../xxx.m3u8?auth_key=...&#10;整条链接原样粘进来，问号后面的参数一个都别少"></textarea>
+  <div class="row" style="margin-top:10px">
+    <div><label>Referer（防盗链用）</label>
+      <input type="text" id="h-referer" placeholder="留空 = 自动用地址同域，例如 https://video.xxx.com/"></div>
+    <div class="sp" style="flex:0 0 auto">
+      <button onclick="fillReferer()" title="用地址的域名拼一个 Referer 填进去">同域</button>
+      <button class="primary" onclick="probeHls()">🔍 检测地址</button>
+    </div>
+  </div>
+  <div class="hint" id="h-probe-msg">粘完先点「检测地址」：探一次播放列表，把切片数、时长、加密方式，以及 403 到底被谁拦的说清楚，再决定下不下</div>
+</div>
+
+<!-- ② 请求头 -->
+<div class="card">
+  <div class="row" style="align-items:flex-start">
+    <div style="flex:2"><label>User-Agent</label><input type="text" id="h-ua"></div>
+    <div><label>额外请求头（可选，每行一条）</label>
+      <textarea id="h-headers" class="slim" placeholder="Cookie: xxx&#10;Origin: https://xxx"></textarea></div>
+  </div>
+  <div class="hint">很多 CDN 是 UA + Referer 双校验，缺任意一个都是 403。这两项默认已是浏览器值，一般不用动；要登录的站把 Cookie 贴到右边。</div>
+</div>
+
+<!-- ③ 存到哪 -->
+<div class="card">
+  <div class="row">
+    <div><label>保存目录</label><input type="text" id="h-dir"></div>
+    <div style="flex:0 0 210px"><label>文件名（留空=自动）</label>
+      <input type="text" id="h-name" placeholder="m3u8_20261102_011500"></div>
+    <div style="flex:0 0 100px"><label>格式</label>
+      <select id="h-fmt"><option value="mp4">mp4</option><option value="mkv">mkv</option><option value="ts">ts</option></select></div>
+    <div class="sp" style="flex:0 0 auto">
+      <button onclick="pickDir()" title="弹系统文件夹选择框">选择…</button>
+      <button onclick="openHlsDir()">打开</button>
+    </div>
+  </div>
+</div>
+
+<!-- ④ 参数 -->
+<div class="card">
+  <label>② N_m3u8DL-RE 参数</label>
+  <div class="row">
+    <div style="flex:0 0 112px"><label>下载线程</label><input type="number" id="h-threads" value="20" min="1" max="128"></div>
+    <div style="flex:0 0 112px"><label>失败重试</label><input type="number" id="h-retry" value="3" min="0" max="20"></div>
+    <div style="flex:0 0 124px"><label>超时（秒）</label><input type="number" id="h-timeout" value="100" min="5" max="600"></div>
+    <div style="flex:1;min-width:150px"><label>限速</label><input type="text" id="h-speed" placeholder="不限 / 15M / 500K"></div>
+  </div>
+  <div class="row" style="margin-top:13px;gap:16px">
+    <label class="chk" style="margin:0"><input type="checkbox" id="h-auto" checked> 自动选最高画质</label>
+    <label class="chk" style="margin:0" title="-mt：音轨/视频/字幕同时下"><input type="checkbox" id="h-concurrent"> 分片并发</label>
+    <label class="chk" style="margin:0" title="--del-after-done：下完删掉临时分片"><input type="checkbox" id="h-del" checked> 删临时文件</label>
+    <label class="chk" style="margin:0" title="--skip-merge：只下不合并，得到一堆 .ts"><input type="checkbox" id="h-nomerge"> 不合并</label>
+    <label class="chk" style="margin:0" title="关掉可绕开系统代理直连（嗅探开着时建议关）"><input type="checkbox" id="h-proxy" checked> 走系统代理</label>
+  </div>
+  <div class="row" style="margin-top:13px">
+    <div><label>手动密钥（留空 = 自动取）</label>
+      <input type="text" id="h-key" placeholder="32 位 hex 或 KID:KEY —— 只有自动取不到密钥时才要填"></div>
+    <div><label>额外命令行参数</label>
+      <input type="text" id="h-extra" placeholder="例如 --custom-hls-method AES_128"></div>
+  </div>
+  <div class="row" style="margin-top:13px">
+    <div><label>N_m3u8DL-RE 路径</label><input type="text" id="h-exe" placeholder="D:\...\N_m3u8DL-RE.exe"></div>
+    <div class="sp" style="flex:0 0 auto"><button onclick="setReExe()">检测</button></div>
+  </div>
+  <div class="hint" id="h-exe-msg">—</div>
+  <button class="primary" style="margin-top:12px" onclick="startHls()">▶ 开始下载</button>
 </div>
 
 <!-- ⑤ 任务 -->
 <div class="card">
   <div class="row" style="align-items:center;margin-bottom:4px">
-    <label style="margin:0;flex:1">⑤ 任务与进度 <span class="tag" id="qinfo"></span></label>
-    <div class="sp">
-      <button class="mini" onclick="pauseAll()" title="停下所有录制和下载，文件保留，随时可以恢复">⏸ 全部暂停</button>
-      <button class="mini" onclick="resumeAll()" title="把暂停的任务重新排进队列">▶ 全部恢复</button>
-      <button class="mini" onclick="dedupTasks()">🧹 清理重复项</button>
-      <button class="mini" onclick="clearDone()">清理已结束</button>
-    </div>
+    <label style="margin:0;flex:1">③ 下载任务 <span class="tag" id="h-qinfo"></span></label>
+    <div class="sp"><button class="mini" onclick="clearHls()">清理已结束</button></div>
   </div>
   <table>
-    <thead><tr><th style="width:40px">队列</th><th style="width:78px">状态</th><th>名称</th>
-      <th style="width:66px">时长</th><th style="width:150px">大小 / 进度</th>
-      <th style="width:190px">操作</th></tr></thead>
-    <tbody id="tasks"></tbody>
+    <thead><tr><th style="width:74px">状态</th><th>名称</th>
+      <th style="width:196px">进度</th><th style="width:148px">速度 / 大小</th>
+      <th style="width:74px">用时</th><th style="width:158px">操作</th></tr></thead>
+    <tbody id="h-tasks"></tbody>
   </table>
-  <div class="hint" id="empty-tasks">还没有任务。</div>
+  <div class="hint" id="h-empty">还没有任务。上面粘一条地址就能开始。</div>
 </div>
 
-<div class="card"><label>日志</label><div id="log"></div></div>
+<div class="card"><label>④ 日志</label><div id="h-log"></div></div>
+
+</div><!-- /pane-hls -->
+
 <div class="foot">本地运行 · 只监听 127.0.0.1 · 关掉网页不影响后台录制，关掉程序才会停</div>
 </div>
 
@@ -330,7 +443,7 @@ function hitInfo(h){
 }
 function hitsSignature(hits){
   return hits.map(h => [h.id, h.kind, h.name, h.status, h.decode_key ? 1 : 0,
-                        h.played ? 1 : 0, h.now ? 1 : 0,
+                        h.played ? 1 : 0, h.now ? 1 : 0, h.expired ? 1 : 0,
                         h.url ? h.url.length : 0].join("~")).join("|");
 }
 
@@ -444,14 +557,16 @@ function renderHits(raw){
     const tr = document.createElement("tr");
     const on = checked.has(String(id)) ? " checked" : "";
     const joined = h.status === "已入队";
-    tr.innerHTML = '<td><input type="checkbox" class="pick" value="'+id+'"'+on+'></td>'+
+    tr.innerHTML = '<td><input type="checkbox" class="pick" value="'+id+'"'+on+(h.expired?' disabled':'')+'></td>'+
       "<td>"+esc(h.t||"")+"</td>"+
       "<td>"+kindTag(h)+"</td>"+
       '<td><input type="text" class="hname" data-id="'+id+'" value="'+esc(h.name)+'" placeholder="点这里填名称"></td>'+
       '<td><span class="tag">'+hitInfo(h)+"</span></td>"+
-      '<td><span class="tag">'+esc(h.status||"")+"</span></td>"+
-      '<td><button class="mini'+(joined?" ghost":"")+'" onclick="recHit('+id+')"'+
-        (joined?' title="已经入过队了。再点会另外再下一份（文件名自动加序号）"':' title="加入下载队列"')+'>'+
+      '<td><span class="tag'+(h.expired?' bad':'')+'">'+esc(h.status||"")+"</span></td>"+
+      '<td><button class="mini'+(joined?" ghost":"")+'"'+((h.expired||joined)?" disabled":"")+
+        ' onclick="recHit('+id+')"'+
+        (h.expired?' title="地址已过期（预约直播或页面缓存），请刷新直播页重新抓一条"'
+         :(joined?' title="已经入过队了。再点会另外再下一份（文件名自动加序号）"':' title="加入下载队列"'))+'>'+
         (h.kind==="replay"?"入队下载":"入队录制")+
       '</button> <button class="mini ghost" onclick="delHit('+id+')" title="删除这条结果">✕</button></td>';
     tb.appendChild(tr);
@@ -682,6 +797,18 @@ async function poll(){
     TASKS = {};
     (d.tasks||[]).forEach(t => TASKS[t.id] = t);
     renderTasks(d.tasks || []);
+
+    /* m3u8 标签页的数据搭同一趟车回来，不多开一个轮询 */
+    const h = d.hls || {};
+    renderHls(h.jobs || []);
+    (h.logs || []).forEach(hlog);
+    if (h.exe && !$("h-exe").value) $("h-exe").value = h.exe;
+    if (h.exe && $("h-exe-msg").textContent === "—"){
+      $("h-exe-msg").className = "hint ok";
+      $("h-exe-msg").textContent = "✔ 已就绪：" + h.exe;
+    }
+    if (!$("h-dir").value && h.dir) $("h-dir").value = h.dir;
+
     const running = (d.tasks||[]).filter(t => t.status === "录制中" || t.status === "下载中");
     $("qinfo").textContent = (running.length ? "进行中 " + running.length : "") +
       (d.queued ? (running.length ? " · " : "") + "队列 " + d.queued : "");
@@ -753,6 +880,209 @@ try {
 } catch(e){}
 /* 把前端的默认值同步给后端（后端默认也是开，这里只是兜底老浏览器） */
 post("/api/sniff/filter", {only_playing: $("only-playing").checked});
+/* ================= m3u8 / HLS 标签页 ================= */
+const UA_CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const HST = {"排队中":["wait","排队"], "下载中":["rec","下载"], "合并中":["rec","合并"],
+             "已完成":["ok","完成"], "失败":["err","失败"], "已停止":["","已停"]};
+const HLS_FIELDS = ["h-referer","h-ua","h-dir","h-fmt","h-threads","h-retry","h-timeout",
+                    "h-speed","h-extra","h-key","h-headers"];
+let hlsSig = "", HJOBS = {};
+
+function switchTab(name){
+  const bs = document.querySelectorAll(".tabs button");
+  for (let i = 0; i < bs.length; i++)
+    bs[i].classList.toggle("on", bs[i].dataset.tab === name);
+  $("pane-sph").style.display = name === "sph" ? "" : "none";
+  $("pane-hls").style.display = name === "hls" ? "" : "none";
+  $("sub").textContent = name === "hls"
+    ? "粘 m3u8 地址 → 先探测（切片数/时长/加密方式/403 真因）→ 自动解密下载 → MP4"
+    : "嗅探地址 → 勾选入队 → 直播边录边存、回放下载后自动解密 → MP4";
+  try { localStorage.setItem("wxlive_tab", name); } catch(e){}
+}
+
+function hlog(t){
+  const box = $("h-log");
+  const d = document.createElement("div");
+  d.textContent = t;
+  if (t.indexOf("✔") >= 0) d.className = "ok";
+  else if (t.indexOf("✘") >= 0) d.className = "bad";
+  else if (t.indexOf("⚠") >= 0) d.className = "warn";
+  else if (t.indexOf("▶") >= 0 || t.indexOf("＋") >= 0) d.className = "blue";
+  box.appendChild(d);
+  box.scrollTop = box.scrollHeight;
+  while (box.children.length > 400) box.removeChild(box.firstChild);
+}
+
+function hlsOpts(){
+  const n = id => +($(id).value || 0);
+  return {
+    url: $("h-url").value.trim(),
+    referer: $("h-referer").value.trim(),
+    ua: $("h-ua").value.trim(),
+    extra_headers: $("h-headers").value,
+    dir: $("h-dir").value.trim(),
+    name: $("h-name").value.trim(),
+    fmt: $("h-fmt").value,
+    threads: n("h-threads") || 20,
+    retry: n("h-retry"),
+    timeout: n("h-timeout") || 100,
+    max_speed: $("h-speed").value.trim(),
+    auto_select: $("h-auto").checked,
+    concurrent: $("h-concurrent").checked,
+    del_after_done: $("h-del").checked,
+    skip_merge: $("h-nomerge").checked,
+    use_system_proxy: $("h-proxy").checked,
+    key: $("h-key").value.trim(),
+    extra: $("h-extra").value.trim()
+  };
+}
+
+function fillReferer(){
+  try { $("h-referer").value = new URL($("h-url").value.trim()).origin + "/"; }
+  catch(e){ toast("先粘一条完整地址", "warn"); }
+}
+
+async function probeHls(){
+  const o = hlsOpts();
+  if (!o.url.startsWith("http")){ toast("先粘一条 m3u8 地址", "warn"); return; }
+  const box = $("h-probe-msg");
+  box.className = "hint";
+  box.textContent = "检测中…";
+  const d = await post("/api/hls/probe", o);
+  if (d.ok){
+    box.className = "hint ok";
+    box.textContent = "✔ " + d.msg + (d.auto_referer ? "（已自动用 " + d.auto_referer + " 作 Referer）" : "");
+    // 服务器帮你试出来的 Referer 直接落进输入框，下载时就不用再猜
+    if (d.auto_referer && !$("h-referer").value.trim()) $("h-referer").value = d.auto_referer;
+  } else {
+    box.className = "hint bad";
+    box.textContent = "✘ " + (d.msg || "检测失败") +
+      (d.auto_referer ? "（已用 " + d.auto_referer + " 作 Referer 试过一次）" : "");
+  }
+  saveHlsLocal();
+}
+
+async function startHls(){
+  const o = hlsOpts();
+  if (!o.url.startsWith("http")){ toast("先粘一条 m3u8 地址", "warn"); return; }
+  const d = await post("/api/hls/start", o);
+  if (say(d)){
+    $("h-name").value = "";       // 名字是给这一次用的，别留给下一条
+    hlsSig = "";
+  }
+  saveHlsLocal();
+}
+
+async function hlsAction(path, id){
+  const d = await post(path, {id: id});
+  say(d);
+  hlsSig = "";
+}
+
+async function clearHls(){
+  const d = await post("/api/hls/clear", {});
+  say(d); hlsSig = "";
+}
+
+function openHlsOut(id){
+  const j = HJOBS[id];
+  if (!j || !j.out){ toast("这条还没有产出文件", "warn"); return; }
+  apiGet("/api/open?path=" + encodeURIComponent(j.out)).then(d => say(d));
+}
+
+async function pickDir(){
+  const d = await post("/api/pickdir", {initial: $("h-dir").value.trim()});
+  if (d.ok && d.path){ $("h-dir").value = d.path; saveHlsLocal(); }
+  else if (!d.ok) toast(d.msg || "没有选择目录", "warn");
+}
+
+function openHlsDir(){
+  const d = $("h-dir").value.trim();
+  if (!d){ toast("先填保存目录", "warn"); return; }
+  apiGet("/api/open?path=" + encodeURIComponent(d)).then(r => say(r));
+}
+
+async function setReExe(){
+  const box = $("h-exe-msg");
+  const d = await post("/api/hls/re", {path: $("h-exe").value.trim()});
+  if (d.ok){
+    box.className = "hint ok";
+    box.textContent = "✔ 可用 · v" + esc(d.version) + " · " + esc(d.path);
+    toast("下载器已就绪", "ok");
+  } else {
+    box.className = "hint bad";
+    box.textContent = "✘ " + esc(d.msg || "检测失败");
+  }
+}
+
+function renderHls(jobs){
+  HJOBS = {};
+  for (let i = 0; i < jobs.length; i++) HJOBS[jobs[i].id] = jobs[i];
+  $("h-empty").style.display = jobs.length ? "none" : "";
+  const run = jobs.filter(j => j.status === "下载中" || j.status === "合并中").length;
+  const que = jobs.filter(j => j.status === "排队中").length;
+  $("h-qinfo").textContent = (run ? "进行中 " + run : "") +
+    (que ? (run ? " · " : "") + "排队 " + que : "");
+
+  // 签名相同就不重绘，避免每 700ms 把整张表重建一遍（输入框会丢焦点）
+  const sig = jobs.map(j => [j.id, j.status, j.pct, j.size, j.total, j.speed,
+                             j.eta, j.out, j.elapsed].join("|")).join(";");
+  if (sig === hlsSig) return;
+  hlsSig = sig;
+
+  $("h-tasks").innerHTML = jobs.map(j => {
+    const st = HST[j.status] || ["", j.status];
+    const pct = Math.max(0, Math.min(100, Number(j.pct) || 0));
+    const bar = '<div class="bar"><i style="width:' + pct + '%"></i></div>';
+    const seg = j.seg_total ? '<span class="qpos">' + j.seg_done + "/" + j.seg_total + "</span>" : "";
+    const sp = [j.speed, j.size ? (j.size + (j.total ? " / " + j.total : "")) : ""]
+               .filter(Boolean).join(" · ");
+    let ops = "";
+    if (j.status === "排队中" || j.status === "下载中" || j.status === "合并中")
+      ops += '<button class="mini danger" onclick="hlsAction(\'/api/hls/stop\',' + j.id + ')">停止</button> ';
+    if (j.out) ops += '<button class="mini" onclick="openHlsOut(' + j.id + ')">播放</button> ';
+    ops += '<button class="mini" onclick="hlsAction(\'/api/hls/del\',' + j.id + ')">删除</button>';
+    return "<tr><td><span class=\"st " + st[0] + "\">" + st[1] + "</span></td>" +
+      "<td>" + esc(j.name) + '<span class="note">' + esc(j.dir) + "</span>" +
+        (j.err ? '<span class="note bad">' + esc(j.err) + "</span>" : "") + "</td>" +
+      "<td>" + pct.toFixed(1) + "% " + seg + bar + "</td>" +
+      '<td class="tag">' + esc(sp || "—") +
+        (j.eta ? '<span class="note">剩余 ' + esc(j.eta) + "</span>" : "") + "</td>" +
+      '<td class="tag">' + fmt(j.elapsed) + "</td>" +
+      '<td><div class="sp">' + ops + "</div></td></tr>";
+  }).join("");
+}
+
+function saveHlsLocal(){
+  try{
+    const o = {};
+    HLS_FIELDS.forEach(k => o[k] = $(k).value);
+    ["h-auto","h-concurrent","h-del","h-nomerge","h-proxy"].forEach(k => o[k] = $(k).checked);
+    localStorage.setItem("wxlive_hls", JSON.stringify(o));
+  }catch(e){}
+}
+function loadHlsLocal(){
+  try{
+    const o = JSON.parse(localStorage.getItem("wxlive_hls") || "{}");
+    HLS_FIELDS.forEach(k => { if (typeof o[k] === "string" && o[k] !== "") $(k).value = o[k]; });
+    if (o["h-auto"] === false) $("h-auto").checked = false;
+    if (o["h-concurrent"] === true) $("h-concurrent").checked = true;
+    if (o["h-del"] === false) $("h-del").checked = false;
+    if (o["h-nomerge"] === true) $("h-nomerge").checked = true;
+    if (o["h-proxy"] === false) $("h-proxy").checked = false;
+  }catch(e){}
+  if (!$("h-ua").value) $("h-ua").value = UA_CHROME;
+}
+
+loadHlsLocal();
+document.querySelectorAll("#pane-hls input,#pane-hls select,#pane-hls textarea")
+  .forEach(el => el.addEventListener("change", saveHlsLocal));
+/* ?tab=hls 可以直接打开到 m3u8 页，收藏夹里存一条就不用每次点 */
+try {
+  const q = new URLSearchParams(location.search).get("tab");
+  switchTab(q || localStorage.getItem("wxlive_tab") || "sph");
+} catch(e){}
+
 expiry(); previewName(); renderSortMarks(); poll();
 </script></body></html>
 """

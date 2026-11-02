@@ -495,17 +495,42 @@ def _dump_page_error(flow):
         pass
 
 
+_LIVE_SEEN = set()          # modified: 直播地址去重（responseheaders 会先记一次）
+_LIVE_LOCK = threading.Lock()
+
+
 def responseheaders(flow):
-    """媒体流必须边收边转。
+    """媒体流必须边收边转，且地址要在收到响应头时就记下来。
 
     # modified: mitmproxy 默认先把整个响应体收完再转发。直播 FLV 是无限流，
     # 缓冲永远结束不了 —— 播放器一直转圈，每 3 秒重连一次（实测日志里
     # pull-*.wxlivecdn.com 反复 client disconnect）。这里对直播流和回放媒体
     # 显式开启流式转发：body 不进内存，边下边给，播放才走得动。
+    #
+    # 但开了流式之后，response 钩子要等响应体收完才触发 —— 直播永远收不完，
+    # 于是地址一条都记不到（实测：页面在放，sniffed.jsonl 一直不更新）。
+    # 所以直播地址必须在这里就记，不能等 response。
     """
     try:
         url = flow.request.pretty_url
-        if _is_live(url) or _is_media(url):
+    except Exception:
+        return
+    try:
+        if _is_live(url):
+            key = url.split("?")[0]
+            first = False
+            with _LIVE_LOCK:
+                if key not in _LIVE_SEEN:
+                    if len(_LIVE_SEEN) > 400:
+                        _LIVE_SEEN.clear()
+                    _LIVE_SEEN.add(key)
+                    first = True
+            if first:
+                _append(OUT, {"t": round(time.time(), 3), "kind": "live", "url": url})
+            _record_playing(url)
+            flow.response.stream = True
+            return
+        if _is_media(url):
             flow.response.stream = True
     except Exception:
         pass
@@ -527,8 +552,18 @@ def response(flow):
 
     # --- 直播流地址
     if _is_live(url):
+        # modified: 响应头阶段已经记过；能走到这里的多是 403 这类短响应，
+        # 用同一个去重集合防重复，避免同一个地址写两遍。
+        key = url.split("?")[0]
+        with _LIVE_LOCK:
+            first = key not in _LIVE_SEEN
+            if first:
+                if len(_LIVE_SEEN) > 400:
+                    _LIVE_SEEN.clear()
+                _LIVE_SEEN.add(key)
+        if first:
+            _append(OUT, {"t": round(time.time(), 3), "kind": "live", "url": url})
         _record_playing(url)
-        _append(OUT, {"t": round(time.time(), 3), "kind": "live", "url": url})
         return
 
     # --- 回放媒体：记下服务端告知的加密长度

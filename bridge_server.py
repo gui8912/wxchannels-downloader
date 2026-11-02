@@ -12,8 +12,10 @@
 """
 import json
 import os
+import re
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -70,6 +72,22 @@ def _int(value, default=0):
         return default
 
 
+_LIVE_RE = re.compile(r'https://[^"\\\s]+?\.(?:flv|m3u8)\?[^"\\\s]*')
+
+
+def _is_live_url(u):
+    """直播拉流地址判定（视频号直播 CDN）
+
+    # modified: 页面数据里带着直播地址，但播放器有时只走 WebRTC、不发 HTTP
+    # 请求，光靠代理抓不到；这里补一条从 Bridge 数据里直接捞的路。
+    """
+    try:
+        host = (urllib.parse.urlsplit(u).hostname or "").lower()
+    except Exception:
+        return False
+    return host == "wxlivecdn.com" or host.endswith(".wxlivecdn.com")
+
+
 def _find(obj, out, meta=None, depth=0):
     """递归找同时带 decode_key 和 url 的节点
 
@@ -122,6 +140,18 @@ def _find(obj, out, meta=None, depth=0):
                             "duration": obj.get("video_play_len") or obj.get("duration") or 0,
                             "width": _int(obj.get("width") or 0),
                             "height": _int(obj.get("height") or 0)})
+        # modified: 直播地址没有 decode_key，原先的判定把这整类节点跳过了，
+        # 所以页面在放、列表里却一条都没有。直播流单独认。
+        for k in ("url", "play_url", "flv_url", "live_url", "stream_url"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.startswith("http") and _is_live_url(v):
+                out.append({"url": v, "decode_key": "", "kind": "live",
+                            "title": m.get("title", ""),
+                            "author": m.get("author", ""),
+                            "objectid": m.get("objectid", ""),
+                            "size": 0, "duration": 0,
+                            "width": 0, "height": 0})
+                break
         for v in obj.values():
             _descend(v, out, m, depth)
     elif isinstance(obj, list):
@@ -212,6 +242,17 @@ def handle_payload(payload):
 
     hits = []
     _find(payload, hits)
+    # modified: 有些上报把地址塞在日志文本里（kvReport/log 之类），不是结构化
+    # 节点，_find 递归不到。整条 payload 再扫一遍，兜住这种形态。
+    try:
+        blob = json.dumps(payload, ensure_ascii=False)
+        for u in _LIVE_RE.findall(blob):
+            if _is_live_url(u):
+                hits.append({"url": u, "decode_key": "", "kind": "live",
+                             "title": "", "author": "", "objectid": "",
+                             "size": 0, "duration": 0, "width": 0, "height": 0})
+    except Exception:
+        pass
     seen = set()
     added = 0
     with _lock:
@@ -220,7 +261,8 @@ def handle_payload(payload):
                 continue
             seen.add(h["url"])
             h["t"] = time.strftime("%H:%M:%S")
-            h["kind"] = "replay"
+            # modified: 保留 _find 判定的类型，直播不能被一律写成 replay
+            h["kind"] = h.get("kind") or "replay"
             h["via"] = "bridge"
             _append(OUT_FILE, h)
             added += 1
