@@ -270,6 +270,16 @@ def handle_payload(payload):
         pass
     seen = set()
     added = 0
+    # modified（v5.7.8）只认"正在看的那个直播页"上报的流。
+    #
+    # 视频号的信息流/推荐位页面也会把一堆直播间的流地址一起报上来 ——
+    # 一屏几十条陌生直播就是这么来的。直播页的 URL 是
+    # /web/pages/live?oid=xxxx，用它的 oid 当"房间号"，
+    # 非直播页上报的 live 一律不落盘。
+    page = str(payload.get("page") or "")
+    live_page = "/pages/live" in page
+    m = re.search(r"[?&]oid=([^&]+)", page)
+    room = m.group(1) if (m and live_page) else ""
     with _lock:
         for h in hits:
             if h["url"] in seen:
@@ -283,6 +293,12 @@ def handle_payload(payload):
             h["kind"] = h.get("kind") or "replay"
             h["via"] = "bridge"
             if h["kind"] == "live":
+                if page and not live_page:
+                    # 推荐位/信息流里的直播流：不要
+                    # （page 为空时判断不了，宁可留着也别漏掉真的）
+                    continue
+                h["room"] = room
+                h["page_live"] = True
                 k = _live_key(h["url"])
                 if now - _live_last.get(k, 0.0) < LIVE_REWRITE_SEC:
                     # 同一路流的重复上报：不落盘，免得把文件写成几万行

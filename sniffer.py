@@ -354,6 +354,19 @@ class Sniffer:
             # （旧签名可能已经失效），并挪到列表末尾。
             if kind == "live":
                 mk = media_key(url)
+                # modified（v5.7.8）只留"当前这个直播页"的流。
+                # room 是直播页 URL 里的 oid（bridge 打的标）；换到另一个直播间
+                # 时，上一个房间的条目直接清掉 —— 用户要的是"正在看的这一路"，
+                # 不是他刚才逛过的那些。没有 room 的（代理逮到的 FLV 请求）
+                # 本来就是正在播的流，不动。
+                room = str(meta.get("room") or "")
+                if room:
+                    keep = [h for h in self.hits
+                            if h.get("kind") != "live"
+                            or not h.get("room") or h.get("room") == room]
+                    if len(keep) != len(self.hits):
+                        self.hits = keep
+                        self._seen = {h["url"] for h in self.hits}
                 for i, h in enumerate(self.hits):
                     if h.get("kind") != "live":
                         continue
@@ -364,6 +377,11 @@ class Sniffer:
                     h["ts"] = stamp or time.time()
                     h["expiry"] = exp
                     h["expired"] = expired
+                    if room:
+                        h["room"] = room
+                    # 第一次上报没带作者、后来带上了：补个默认名称
+                    if not h.get("name") and meta.get("author"):
+                        h["name"] = str(meta["author"]).strip()[:80]
                     # 已经入队/在录的那条别被改回"待录制"
                     if h.get("status") not in ("已入队", "录制中", "已完成"):
                         h["status"] = "已过期" if expired else "待录制"
@@ -421,6 +439,12 @@ class Sniffer:
             # 回放接口自带标题，直接用它预填名称
             if kind == "replay" and meta.get("title"):
                 hit["name"] = str(meta["title"]).strip()[:80]
+            # modified（v5.7.8）直播页只知道主播名 —— 直接拿它当默认名称，
+            # 文件名也就叫「作者名（+日期）」，不用每次手动敲。
+            if kind == "live" and not hit["name"] and hit["author"]:
+                hit["name"] = str(hit["author"]).strip()[:80]
+            if meta.get("room"):
+                hit["room"] = str(meta["room"])
             self._next_id += 1
             self.hits.append(hit)
             # 列表只留最近 N 条：一晚上连开几十个直播间，无上限会让前端越刷越卡
@@ -819,6 +843,11 @@ class Sniffer:
             rt = rec.get("t")
             if not isinstance(rt, (int, float)) or not rt:
                 continue
+            # modified（v5.7.8）bridge 上报的直播必须是"正在看的那个直播页"发来的。
+            # 信息流/推荐位页面也会上报一堆直播间的流，这些一条都不要。
+            if kind == "live" and str(rec.get("via") or "").startswith("bridge"):
+                if not rec.get("page_live"):
+                    continue
             if kind == "live":
                 if rt < now - LIVE_KEEP_SECONDS:
                     continue

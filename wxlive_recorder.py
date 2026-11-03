@@ -34,7 +34,7 @@ import sniffer as sniff_mod
 import ui as ui_mod
 import wxdecrypt
 
-VERSION = "5.7.7"
+VERSION = "5.7.8"
 BUILD = "2026-11-02"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2201,7 +2201,8 @@ class Handler(BaseHTTPRequestHandler):
                     skipped += 1
                     continue
                 before = len(STATE["tasks"])
-                t = new_task(h.get("name", ""), h["url"], opts["dir"],
+                # modified（v5.7.8）名字空着就用作者名 —— 文件名默认是主播名
+                t = new_task(h.get("name") or h.get("author") or "", h["url"], opts["dir"],
                              opts["limit"], opts["audio"], opts["silence"],
                              opts["wait_live"], h.get("kind", "live"),
                              h.get("decode_key", ""),
@@ -2230,8 +2231,9 @@ class Handler(BaseHTTPRequestHandler):
                 return {"ok": False,
                         "msg": f"这条地址已于 {h.get('expiry') or '之前'} 过期"
                                f"（多为预约直播或页面缓存），请刷新直播页重新抓一条"}
-            t = new_task(h.get("name", ""), h["url"], opts["dir"], opts["limit"],
-                         opts["audio"], opts["silence"], opts["wait_live"],
+            # modified（v5.7.8）名字空着就用作者名 —— 文件名默认是主播名
+            t = new_task(h.get("name") or h.get("author") or "", h["url"], opts["dir"],
+                         opts["limit"], opts["audio"], opts["silence"], opts["wait_live"],
                          h.get("kind", "live"), h.get("decode_key", ""),
                          with_date=opts["with_date"])
             SNIFFER.mark(body.get("id"), "已入队")
