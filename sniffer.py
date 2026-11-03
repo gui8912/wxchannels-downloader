@@ -35,6 +35,16 @@ PLAYING_FILE = os.path.join(APP_DIR, "playing.jsonl")
 CREATE_NO_WINDOW = 0x08000000
 DEFAULT_PORT = 4880
 MAX_HITS = 400          # 嗅探结果列表最多留多少条
+# modified: 直播地址是"一次性的"——txTime 几小时就失效，隔天再看只剩一堆点不开的
+# 死链。所以只在列表里留最近这么久的直播条目，更早的进来时直接丢掉（回放不受限，
+# 回放地址是长期的，用户可能过几天才想下载）。
+LIVE_KEEP_SECONDS = 6 * 3600
+# "只看正在播放"时，直播条目多久没再被上报就算"不在看了"。
+# bridge 对同一路流最多每 60 秒落一行，所以这个窗口要明显大于 60 秒。
+LIVE_ALIVE_SEC = 180
+# 回放地址也不是永久的：超过这个岁数的回放记录不再从文件里回读，免得
+# 重启后列表里全是点开就 403 的老链接。半天足够覆盖"晚上抓、第二天上午下"。
+HISTORY_MAX_AGE = 12 * 3600
 
 # 解密哪些域名 —— 只解密视频号页面与直播 CDN 两类。
 #
@@ -284,6 +294,7 @@ class Sniffer:
         self._backup = None
         self._upstream = ""          # modified: 接管前的系统代理，作为 mitmproxy 上游接力
         self._locate = 0
+        self._purged = 0             # modified: 上一轮开嗅探时清掉了几条过期直播（只用于提示）
         self._lock = threading.Lock()      # 保护 hits / _seen / _locate
         self._io_lock = threading.Lock()   # 保护文件读取位置
         self._played = set()               # 真正被请求过的媒体 id
@@ -301,6 +312,10 @@ class Sniffer:
     # --- 收集结果
     def _add_hit(self, url, t=None, meta=None):
         meta = meta or {}
+        # modified: 统一记一个"本机秒级时间戳"，用来判断新旧、显示日期。
+        # 旧记录（bridge 老版本写的 "HH:MM:SS" 字符串）没有日期，这里给 0，
+        # 由 poll() 决定是否当历史数据丢掉。
+        stamp = float(t) if isinstance(t, (int, float)) and t else 0.0
         with self._lock:
             if url in self._seen:
                 return None
@@ -329,6 +344,33 @@ class Sniffer:
             kind = meta.get("kind") or "live"
             fsize = meta.get("size") or 0
             title = str(meta.get("title") or "").strip()[:80]
+            # modified（v5.7.7）直播按"流地址去掉签名参数"就地合并。
+            #
+            # 视频号页面每 20 秒就往 bridge 上报一次同一路直播，每次带的
+            # combuf/sv/txSecret 都可能不同，按整条 URL 去重等于没去重 ——
+            # 实测同一路流在列表里堆了 40+ 条，用户点了「清理重复」，
+            # 20 秒后新的一批又长回来，看着就像"清理没作用"。
+            # 这里认出是同一路流就不再新增，只把地址刷成最新的那份
+            # （旧签名可能已经失效），并挪到列表末尾。
+            if kind == "live":
+                mk = media_key(url)
+                for i, h in enumerate(self.hits):
+                    if h.get("kind") != "live":
+                        continue
+                    if media_key(h.get("url") or "") != mk:
+                        continue
+                    h["url"] = url
+                    h["t"] = when
+                    h["ts"] = stamp or time.time()
+                    h["expiry"] = exp
+                    h["expired"] = expired
+                    # 已经入队/在录的那条别被改回"待录制"
+                    if h.get("status") not in ("已入队", "录制中", "已完成"):
+                        h["status"] = "已过期" if expired else "待录制"
+                    h["played"] = not expired
+                    self.hits.append(self.hits.pop(i))
+                    return None
+
             # 同一个视频每请求一次就换一套 decode_key + token（svrnonce 每次不同），
             # 按 url 去重等于没去重，列表里全是一个视频的多个副本。
             # 按「标题 + 文件大小」认人，重复出现时只把地址刷新成最新的那份
@@ -352,10 +394,12 @@ class Sniffer:
                     if meta.get("objectid"):
                         h["objectid"] = str(meta["objectid"])
                     h["t"] = when
+                    h["ts"] = stamp or time.time()
                     if fsize and not h.get("filesize"):
                         h["filesize"] = fsize
                     return None
             hit = {"id": self._next_id, "url": url, "t": when, "kind": kind,
+                   "ts": stamp or time.time(),
                    "expiry": exp, "expired": expired,
                    "name": "", "status": "已过期" if expired else "待录制",
                    "decode_key": str(meta.get("decode_key") or ""),
@@ -412,6 +456,24 @@ class Sniffer:
             n = len(self.hits)
             self.hits = []
             self._seen = set()
+        return n
+
+    def purge_stale_live(self):
+        """丢掉"上一轮/昨天"残留的直播条目。
+
+        直播地址是一次性的：过了几小时 txTime 就作废，留着只会在列表里
+        制造一堆点不开的死链。开始新一轮嗅探时先清一遍，列表里剩下的
+        才是这次真正抓到的。回放条目一律保留。
+        """
+        cutoff = time.time() - LIVE_KEEP_SECONDS
+        with self._lock:
+            keep = [h for h in self.hits
+                    if h.get("kind") != "live"
+                    or float(h.get("ts") or 0) >= cutoff]
+            n = len(self.hits) - len(keep)
+            if n:
+                self.hits = keep
+                self._seen = {h["url"] for h in self.hits}
         return n
 
     # --- "这个视频到底在不在播"
@@ -586,6 +648,13 @@ class Sniffer:
             self.state, self.msg = "失败", why
             return ok, why
 
+        # modified（v5.7.7）开始新一轮嗅探前，先清掉上一轮/昨天残留的直播条目，
+        # 否则列表一打开就是几十条早就失效的地址，用户以为"昨天抓的又冒出来了"。
+        try:
+            self._purged = self.purge_stale_live()
+        except Exception:
+            self._purged = 0
+
         exe = find_mitmdump()
         addon = os.path.join(APP_DIR, "capture_addon.py")
         if not os.path.isfile(addon):
@@ -696,6 +765,9 @@ class Sniffer:
                     + (f"（上游经 {self._upstream.split('//')[-1]} 转发）"
                        if self._upstream else "")
                     + "，去微信里打开回放页面（会注入 JS 抓 decode_key）")
+        if getattr(self, "_purged", 0):
+            self.msg += f"；已清掉 {self._purged} 条过期的直播地址"
+            self._purged = 0
         self.caught = None
         with self._io_lock:
             self._locate = 0
@@ -737,6 +809,21 @@ class Sniffer:
             # 直播只认 flv 流；回放是 mp4（stodownload 之类）
             if kind == "live" and ".flv" not in u.lower():
                 continue
+            # modified（v5.7.7）只认"带时间戳、且够新"的记录。
+            #
+            # 旧版把时间写成 "HH:MM:SS"，没有日期 —— 服务重启后再点开始嗅探，
+            # poll 会从文件头把昨天、前天的记录全部重放一遍，列表里于是冒出
+            # 一堆"昨天嗅探到的地址"。一条都留不住日期就判断不了新旧，
+            # 一律当历史丢掉；新写入的记录统一带 epoch 时间戳，不受影响。
+            now = time.time()
+            rt = rec.get("t")
+            if not isinstance(rt, (int, float)) or not rt:
+                continue
+            if kind == "live":
+                if rt < now - LIVE_KEEP_SECONDS:
+                    continue
+            elif rt < now - HISTORY_MAX_AGE:
+                continue      # 回放也不能无限往回翻，半天以前的签名基本都没用了
             hit = self._add_hit(u, rec.get("t"), rec)
             if hit:
                 new_hits.append(hit)
@@ -833,13 +920,22 @@ class Sniffer:
         shown, hidden = all_hits, 0
         if self.only_playing:
             # 只挡"能确定是侧栏推荐"的那些：
-            #   · 直播流一律留（房间里只有这一路，没有侧栏）
+            #   · 直播流：靠"还在被上报"判断 —— 你在看的那个房间每 20 秒
+            #     会再报一次，页面推荐列表里的其它直播间只报一次，
+            #     LIVE_ALIVE_SEC 之后就沉下去（modified v5.7.7）
             #   · 没有 object_id 的判断不了，宁可放出来也别让用户以为没抓到
             #   · 有 object_id 但从没被播过的，才是侧栏推荐
+            now = time.time()
             keep, drop = [], 0
             for h in all_hits:
-                if (h.get("kind") == "live" or h.get("played")
-                        or not h.get("objectid")):
+                if h.get("kind") == "live":
+                    fresh = (now - float(h.get("ts") or 0)) <= LIVE_ALIVE_SEC
+                    if fresh:
+                        keep.append(h)
+                    else:
+                        drop += 1
+                    continue
+                if h.get("played") or not h.get("objectid"):
                     keep.append(h)
                 else:
                     drop += 1

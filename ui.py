@@ -163,6 +163,7 @@ textarea.slim{height:52px}
   <div class="filt">
     <label class="chk" title="播放器只会为「正在播放」的那个视频上报播放进度，侧栏推荐不会。默认开着，列表里就只剩你在看的那条"><input type="checkbox" id="only-playing" checked> 只看正在播放的视频</label>
     <span class="tag" id="hidden-info" style="color:#d29922"></span>
+    <span class="tag" id="folded-info" style="color:#8b949e"></span>
     <button class="mini ghost" id="b-showall" style="display:none" onclick="setOnlyPlaying(false)">显示全部</button>
     <span class="tag">体积 ≥</span>
     <input type="number" id="min-mb" value="0" min="0" step="50">
@@ -454,6 +455,7 @@ function hitInfo(h){
 function hitsSignature(hits){
   return hits.map(h => [h.id, h.kind, h.name, h.status, h.decode_key ? 1 : 0,
                         h.played ? 1 : 0, h.now ? 1 : 0, h.expired ? 1 : 0,
+                        h.ts || 0,
                         h.url ? h.url.length : 0].join("~")).join("|");
 }
 
@@ -525,19 +527,57 @@ function applyFilter(list){
   if (!minMb) return list || [];
   return (list || []).filter(h => (h.filesize || 0) >= minMb * 1048576);
 }
+/* ---------- 同一直播流折叠 ----------
+   视频号页面每 20 秒上报一次同一路直播，签名参数一变就是一条"新地址"，
+   列表里于是堆出几十条一模一样的结果，点「清理重复」20 秒后又长回来。
+   后端 v5.7.7 起在源头就合并了；这里再兜一层：同一条流（地址去掉 ?签名）
+   只显示最新的一条，其余折叠成"另有 N 条旧地址"，防止旧进程/旧数据继续刷屏。 */
+function liveKey(h){ return (h.url || "").split("?")[0]; }
+const LIVE_BUSY = {"已入队":1, "录制中":1, "已完成":1};
+function collapseLive(list){
+  const at = new Map(), out = [];
+  let n = 0;
+  (list || []).forEach(h => {
+    if ((h.kind || "live") !== "live"){ out.push(h); return; }
+    const k = liveKey(h);
+    if (!at.has(k)){ at.set(k, out.length); out.push(h); return; }
+    const i = at.get(k), prev = out[i];
+    const busyPrev = !!LIVE_BUSY[prev.status], busyNew = !!LIVE_BUSY[h.status];
+    // 已入队/在录的那条不能被"更新的待录制"顶掉
+    if (busyNew || (!busyPrev && (h.id || 0) > (prev.id || 0))) out[i] = h;
+    n++;
+  });
+  return {list: out, n};
+}
+/* 时间列：有 ts 就带上日期（今天只显示时分秒，昨天/更早显示"昨天 14:12"），
+   否则退回后端给的字符串 —— 这样"昨天抓的"一眼就能看出来。 */
+function fmtTime(h){
+  const ts = Number(h.ts) || 0;
+  if (!ts) return esc(h.t || "");
+  const d = new Date(ts * 1000), now = new Date();
+  const p = n => String(n).padStart(2, "0");
+  const hm = p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  if (d.toDateString() === now.toDateString()) return hm;
+  const y = new Date(now.getTime() - 86400000);
+  const day = d.toDateString() === y.toDateString()
+    ? "昨天" : p(d.getMonth() + 1) + "-" + p(d.getDate());
+  return day + " " + hm.slice(0, 5);
+}
 function renderHits(raw){
   const all = raw || [];
   window.__hits = all;
-  const hits = sortHits(applyFilter(all));
+  const coll = collapseLive(all);
+  const hits = sortHits(applyFilter(coll.list));
   $("hits-card").style.display = (all.length || HIDDEN) ? "" : "none";
-  $("hit-count").textContent = all.length ? "（" + all.length + " 条）" : "";
+  $("hit-count").textContent = all.length ? "（" + coll.list.length + " 条）" : "";
   // 被后端过滤掉的侧栏推荐：给个明确数字 + 一键放开的入口，
   // 否则用户只会看到空列表，以为坏了
-  $("hidden-info").textContent = HIDDEN ? `已自动过滤 ${HIDDEN} 条侧栏推荐` : "";
+  $("hidden-info").textContent = HIDDEN ? `已自动过滤 ${HIDDEN} 条无关结果` : "";
+  $("folded-info").textContent = coll.n ? `同一直播流的 ${coll.n} 条旧地址已折叠` : "";
   $("b-showall").style.display = (HIDDEN && $("only-playing").checked) ? "" : "none";
-  const shown = (hits.length !== all.length);
+  const shown = (hits.length !== coll.list.length);
   $("filter-info").textContent = shown
-    ? `筛选后 ${hits.length} / ${all.length} 条` : "";
+    ? `筛选后 ${hits.length} / ${coll.list.length} 条` : "";
   if (!all.length && !HIDDEN){
     $("hits-empty").style.display = "none";
   } else if (all.length && !hits.length){
@@ -549,11 +589,11 @@ function renderHits(raw){
     $("hits-empty").style.display = "";
     $("hits-empty").textContent =
       "抓到了 " + TOTAL + " 条，但都不是正在播放的视频。" +
-      "侧栏推荐已自动过滤 —— 在微信里点一下播放，或者点上面的「显示全部」。";
+      "已自动过滤掉推荐位和早就结束的直播 —— 在微信里点一下播放，或者点上面的「显示全部」。";
   } else {
     $("hits-empty").style.display = "none";
   }
-  const sig = hitsSignature(hits) + "#" + filterSig();
+  const sig = hitsSignature(hits) + "#" + filterSig() + "#" + coll.n;
   if (sig === hitsSig) return;
   hitsSig = sig;
   const tb = $("hits");
@@ -568,9 +608,10 @@ function renderHits(raw){
     const on = checked.has(String(id)) ? " checked" : "";
     const joined = h.status === "已入队";
     tr.innerHTML = '<td><input type="checkbox" class="pick" value="'+id+'"'+on+(h.expired?' disabled':'')+'></td>'+
-      "<td>"+esc(h.t||"")+"</td>"+
+      "<td>"+fmtTime(h)+"</td>"+
       "<td>"+kindTag(h)+"</td>"+
-      '<td><input type="text" class="hname" data-id="'+id+'" value="'+esc(h.name)+'" placeholder="点这里填名称"></td>'+
+      '<td><input type="text" class="hname" data-id="'+id+'" value="'+esc(h.name)+'" placeholder="'+
+        esc(h.name ? "点这里填名称" : (h.author ? h.author + "（点这里改名称）" : "点这里填名称"))+'"></td>'+
       '<td><span class="tag">'+hitInfo(h)+"</span></td>"+
       '<td><span class="tag'+(h.expired?' bad':'')+'">'+esc(h.status||"")+"</span></td>"+
       '<td><button class="mini'+(joined?" ghost":"")+'"'+((h.expired||joined)?" disabled":"")+

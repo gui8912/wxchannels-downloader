@@ -26,6 +26,12 @@ PORT_FILE = os.path.join(APP_DIR, "bridge_port.json")
 PORT = int(os.environ.get("WX_BRIDGE_PORT", "18002"))
 MAX_BODY = 4 * 1024 * 1024
 MAX_BRIDGE_FILE = 24 * 1024 * 1024      # 原始记录超过这个大小就滚存一份
+# modified（v5.7.7）：页面每 20 秒上报一次同一路直播，签名参数还常常不变 ——
+# 照单全收会让 sniffed.jsonl 一天涨几万行、列表里同一路流几十条。
+# 同一路流（地址去掉签名参数）在这个窗口内只落一行。
+# 60 秒是折中：再短文件长得快，再长则"清空列表"之后要等很久才重新出现。
+LIVE_REWRITE_SEC = 60
+_live_last = {}                         # 流 key -> 上次落盘时间
 # modified: 只接受视频号页面回传，不能再对任意网页开放 CORS 写入口
 ALLOWED_ORIGINS = {"https://channels.weixin.qq.com"}
 ALLOWED_ORIGINS.update(
@@ -51,6 +57,15 @@ def _rotate(path, limit):
             os.replace(path, path + ".old")
     except Exception:
         pass
+
+
+def _live_key(url):
+    """直播间某一路流的稳定标识：去掉 ?txTime=&txSecret= 之类的签名参数。
+
+    同一个视频/同一路流每次请求都换一套签名，只有路径是稳定的。
+    和 sniffer.media_key 的思路保持一致（那边还要认 encfilekey，直播用不到）。
+    """
+    return (url or "").split("?")[0]
 
 
 def _append(path, rec):
@@ -260,10 +275,19 @@ def handle_payload(payload):
             if h["url"] in seen:
                 continue
             seen.add(h["url"])
-            h["t"] = time.strftime("%H:%M:%S")
+            now = time.time()
+            # modified: 写"本机时间戳"而不是 "HH:MM:SS"。字符串没有日期，
+            # 昨天抓的地址今天冒出来时分不清，也没法按新旧过滤。
+            h["t"] = round(now, 3)
             # modified: 保留 _find 判定的类型，直播不能被一律写成 replay
             h["kind"] = h.get("kind") or "replay"
             h["via"] = "bridge"
+            if h["kind"] == "live":
+                k = _live_key(h["url"])
+                if now - _live_last.get(k, 0.0) < LIVE_REWRITE_SEC:
+                    # 同一路流的重复上报：不落盘，免得把文件写成几万行
+                    continue
+                _live_last[k] = now
             _append(OUT_FILE, h)
             added += 1
         _stats["hits"] += added
@@ -325,9 +349,11 @@ def reparse(path=None):
                     seen.add(k)
                     ts = rec.get("t") or time.time()
                     try:
-                        h["t"] = time.strftime("%H:%M:%S", time.localtime(float(ts)))
+                        # modified（v5.7.7）落盘写时间戳，别写 "HH:MM:SS"：
+                        # 没有日期，服务重启后 poll 无法判断这条是昨天的还是刚才的。
+                        h["t"] = float(ts)
                     except Exception:
-                        h["t"] = time.strftime("%H:%M:%S")
+                        h["t"] = time.time()
                     h["kind"] = "replay"
                     h["via"] = "bridge-reparse"
                     _append(OUT_FILE, h)

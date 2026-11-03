@@ -34,7 +34,7 @@ import sniffer as sniff_mod
 import ui as ui_mod
 import wxdecrypt
 
-VERSION = "5.7.6"
+VERSION = "5.7.7"
 BUILD = "2026-11-02"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2261,7 +2261,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == "/api/hit/dedup":
             n = SNIFFER.dedup()
-            return {"ok": True, "n": n, "msg": f"清理了 {n} 条重复结果"}
+            # modified（v5.7.7）"清理重复"顺手把过期直播也扫掉 —— 用户点这个
+            # 按钮的诉求就是"让列表干净"，只合并重复、留着昨天的死链等于没清。
+            stale = SNIFFER.purge_stale_live()
+            msg = f"清理了 {n} 条重复结果"
+            if stale:
+                msg += f"，另有 {stale} 条过期直播地址已移除"
+            return {"ok": True, "n": n + stale, "msg": msg}
 
         if p == "/api/sniff/start":
             return api_sniff_start()
